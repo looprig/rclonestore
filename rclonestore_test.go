@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // TestNewOptionsValidation covers the pre-exec validation: a bad Remote, Prefix,

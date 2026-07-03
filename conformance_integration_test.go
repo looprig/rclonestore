@@ -6,8 +6,8 @@ import (
 	"os/exec"
 	"testing"
 
-	"github.com/ciram-co/storekit"
-	"github.com/ciram-co/storekit/storetest"
+	"github.com/looprig/storekit"
+	"github.com/looprig/storekit/storetest"
 )
 
 // TestBlobsConformance runs storekit's Blobs conformance suite against a REAL

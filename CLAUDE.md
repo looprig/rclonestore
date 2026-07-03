@@ -5,7 +5,7 @@ thin, security-hardened exec adapter — nothing more.
 
 ## Dependencies
 
-- **stdlib + `github.com/ciram-co/storekit` ONLY. No other third-party dependency, ever.**
+- **stdlib + `github.com/looprig/storekit` ONLY. No other third-party dependency, ever.**
   Do not `go get` anything. Do not add a `require` line beyond storekit.
 - **Never link librclone / cgo.** rclone is driven as a subprocess (argv exec) only. Linking
   the library would pull in a giant dependency tree and defeat the extraction.

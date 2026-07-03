@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // blobFakeSpec bakes the per-subcommand behavior of a stand-in rclone into a

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // rclone's documented exit-code table (https://rclone.org/docs/#list-of-exit-codes)

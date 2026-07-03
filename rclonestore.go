@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // defaultBinary is the rclone executable name resolved via exec.LookPath when
