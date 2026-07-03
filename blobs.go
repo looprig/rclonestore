@@ -29,23 +29,34 @@ const (
 const notFoundMarker = "not found"
 
 // blobStore implements storekit.Blobs by driving the rclone binary through a
-// runner. Each object lives at "<remote>:<prefix>/<key>": remote and prefix are
-// fixed at construction, key is a validated storekit name supplied per call. The
-// store is pure mechanism over rclone — the workspace store above it owns the
-// single-writer lease that makes the Put existence-then-write sequence sound.
+// runner. Each object's rclone path is built from the remote, the store prefix,
+// and the per-call validated key by remoteJoin, which is aware of both remote
+// forms — a named remote ("R:<path>") vs. a ":backend:" connection string
+// ("<remote>/<path>"). remote and prefix are fixed at construction; the key is a
+// validated storekit name supplied per call. The store is pure mechanism over
+// rclone — the workspace store above it owns the single-writer lease that makes
+// the Put existence-then-write sequence sound.
 type blobStore struct {
-	r      *runner
-	remote string
-	prefix string
+	r          *runner
+	remote     string
+	prefix     string
+	connString bool // remote is a ":backend:" connection string (leading ':'), not a named remote
 }
 
 var _ storekit.Blobs = (*blobStore)(nil)
 
-// newBlobStore constructs a blobStore over an already-configured runner. Open and
-// Options (binary resolution, remote reachability probe) are RC3's job; this
-// constructor takes the resolved remote and prefix directly.
+// newBlobStore constructs a blobStore over an already-configured runner. Binary
+// resolution, option validation, and the remote-reachability probe live in New;
+// this constructor takes the already-resolved remote and prefix directly and
+// derives the remote form (named vs. connection string) from the remote's leading
+// byte.
 func newBlobStore(r *runner, remote, prefix string) *blobStore {
-	return &blobStore{r: r, remote: remote, prefix: prefix}
+	return &blobStore{
+		r:          r,
+		remote:     remote,
+		prefix:     prefix,
+		connString: strings.HasPrefix(remote, ":"),
+	}
 }
 
 // PutSourceError reports that reading the caller-supplied Put reader failed before
@@ -213,21 +224,54 @@ func (b *blobStore) rcat(ctx context.Context, path string, r io.Reader) error {
 	return b.r.run(ctx, "rcat", nil, []string{path}, r, io.Discard)
 }
 
-// objectPath builds the single positional path for a key: "<remote>:<prefix>/<key>",
-// collapsing to "<remote>:<key>" when the store has no prefix so no spurious leading
-// slash is introduced. The runner inserts "--" before this positional, so a key or
-// remote beginning with '-' can never be parsed as a flag.
+// objectPath builds the single positional path for a key: the key joined under
+// the store prefix, appended to the remote in its correct form (see remoteJoin).
+// The runner inserts "--" before this positional, so a key or remote beginning
+// with '-' can never be parsed as a flag.
 func (b *blobStore) objectPath(key string) string {
-	if b.prefix == "" {
-		return b.remote + ":" + key
-	}
-	return b.remote + ":" + b.prefix + "/" + key
+	return b.remoteJoin(joinPath(b.prefix, key))
 }
 
-// listRoot is the recursive-listing root: "<remote>:<prefix>" (or "<remote>:" with
-// no prefix). lsf paths under it are relative to it, i.e. they are storekit keys.
+// listRoot is the recursive-listing (and startup-probe) root: the store prefix
+// appended to the remote. lsf paths under it are relative to it, i.e. they are
+// storekit keys.
 func (b *blobStore) listRoot() string {
-	return b.remote + ":" + b.prefix
+	return b.remoteJoin(b.prefix)
+}
+
+// remoteJoin appends a store-relative path to the remote in the form rclone
+// requires, which differs by how the remote was given:
+//
+//   - A NAMED remote "R" (a config alias, e.g. "myremote") is separated from its
+//     path by a colon ("R:" concatenated with path): "myremote" and "blobs/x"
+//     give "myremote:blobs/x". An empty path yields the bare "R:".
+//   - A CONNECTION STRING (e.g. ":local:/tmp/x" or ":s3,provider=…:") already ends
+//     its backend spec with a colon, so a further colon would be misparsed; the
+//     path is appended with a slash ("<remote>/" concatenated with path):
+//     ":local:/tmp/x" and "blobs/x" give ":local:/tmp/x/blobs/x". An empty path
+//     yields the bare remote.
+//
+// The form is fixed at construction (connString) from whether the remote begins
+// with ':'. Getting this wrong is the RC2 bug this replaces: a hardcoded colon
+// turned ":local:/tmp/x" + key into the invalid ":local:/tmp/x:key".
+func (b *blobStore) remoteJoin(path string) string {
+	if b.connString {
+		if path == "" {
+			return b.remote
+		}
+		return b.remote + "/" + path
+	}
+	return b.remote + ":" + path
+}
+
+// joinPath joins a store-relative rest (a validated key, or a caller List prefix)
+// under the store prefix, collapsing an empty store prefix so no spurious leading
+// slash is introduced.
+func joinPath(prefix, rest string) string {
+	if prefix == "" {
+		return rest
+	}
+	return prefix + "/" + rest
 }
 
 // isNotFound reports whether err is a not-found from rclone. It classifies on the

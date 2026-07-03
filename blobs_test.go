@@ -117,19 +117,150 @@ func assertDashDashBeforePositional(t *testing.T, argv []string, wantPositional 
 	}
 }
 
-// newTestBlobStore wires a blobStore over a runner pointed at a freshly generated
-// fake rclone in a fresh temp dir, returning the store and the dir (for argv/stdin
-// assertions). No config path is set, so no --config appears in any argv.
-func newTestBlobStore(t *testing.T, spec blobFakeSpec) (*blobStore, string) {
+// newTestBlobStoreWith wires a blobStore over a runner pointed at a freshly
+// generated fake rclone in a fresh temp dir, for the given remote and prefix,
+// returning the store and the dir (for argv/stdin assertions). No config path is
+// set, so no --config appears in any argv.
+func newTestBlobStoreWith(t *testing.T, spec blobFakeSpec, remote, prefix string) (*blobStore, string) {
 	t.Helper()
 	dir := t.TempDir()
 	bin := writeBlobFake(t, dir, spec)
-	return newBlobStore(&runner{binary: bin}, "remote", "pfx"), dir
+	return newBlobStore(&runner{binary: bin}, remote, prefix), dir
+}
+
+// newTestBlobStore is newTestBlobStoreWith for the default named-remote fixture
+// ("remote", prefix "pfx"), used by the bulk of the behavioral tests.
+func newTestBlobStore(t *testing.T, spec blobFakeSpec) (*blobStore, string) {
+	t.Helper()
+	return newTestBlobStoreWith(t, spec, "remote", "pfx")
 }
 
 func TestBlobStoreImplementsBlobs(t *testing.T) {
 	t.Parallel()
 	var _ storekit.Blobs = (*blobStore)(nil)
+}
+
+// TestObjectPathForms pins the remote-form-aware path construction for BOTH remote
+// forms and the empty-prefix collapse: a named remote joins its path with a colon
+// ("R:<path>"), a ":backend:" connection string joins with a slash
+// ("<remote>/<path>"), and an empty store prefix introduces no spurious slash.
+func TestObjectPathForms(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		remote   string
+		prefix   string
+		key      string
+		wantObj  string
+		wantRoot string
+	}{
+		{
+			name: "named remote with prefix", remote: "myremote", prefix: "pfx", key: "blobs/abc",
+			wantObj: "myremote:pfx/blobs/abc", wantRoot: "myremote:pfx",
+		},
+		{
+			name: "named remote empty prefix collapses (no spurious slash)", remote: "myremote", prefix: "", key: "blobs/abc",
+			wantObj: "myremote:blobs/abc", wantRoot: "myremote:",
+		},
+		{
+			name: "connection string with path and prefix", remote: ":local:/tmp/x", prefix: "pfx", key: "blobs/abc",
+			wantObj: ":local:/tmp/x/pfx/blobs/abc", wantRoot: ":local:/tmp/x/pfx",
+		},
+		{
+			name: "connection string empty prefix appends with slash", remote: ":local:/tmp/x", prefix: "", key: "blobs/abc",
+			wantObj: ":local:/tmp/x/blobs/abc", wantRoot: ":local:/tmp/x",
+		},
+		{
+			name: "bare backend connection string empty prefix", remote: ":local:", prefix: "", key: "blobs/abc",
+			wantObj: ":local:/blobs/abc", wantRoot: ":local:",
+		},
+		{
+			name: "s3-style connection string with params", remote: ":s3,provider=Minio:", prefix: "snaps", key: "x/y",
+			wantObj: ":s3,provider=Minio:/snaps/x/y", wantRoot: ":s3,provider=Minio:/snaps",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b := newBlobStore(nil, tt.remote, tt.prefix)
+			if got := b.objectPath(tt.key); got != tt.wantObj {
+				t.Errorf("objectPath(%q) = %q, want %q", tt.key, got, tt.wantObj)
+			}
+			if got := b.listRoot(); got != tt.wantRoot {
+				t.Errorf("listRoot() = %q, want %q", got, tt.wantRoot)
+			}
+		})
+	}
+}
+
+// TestBlobsConnStringPositional drives every verb through a fake rclone with a
+// connection-string remote and asserts the actual `--`-guarded positional is the
+// correctly slash-joined path — the end-to-end proof of the remote-form fix (a
+// hardcoded colon would produce the invalid ":local:/tmp/root:pfx/blobs/k").
+func TestBlobsConnStringPositional(t *testing.T) {
+	t.Parallel()
+	const (
+		remote  = ":local:/tmp/root"
+		prefix  = "pfx"
+		key     = "blobs/k"
+		wantObj = ":local:/tmp/root/pfx/blobs/k"
+		wantRt  = ":local:/tmp/root/pfx"
+	)
+
+	t.Run("Get object path", func(t *testing.T) {
+		t.Parallel()
+		b, dir := newTestBlobStoreWith(t, blobFakeSpec{catOut: []byte("x")}, remote, prefix)
+		rc, err := b.Get(context.Background(), key)
+		requireNoErr(t, err)
+		if cerr := rc.Close(); cerr != nil {
+			t.Fatalf("Close: %v", cerr)
+		}
+		argv, ok := argvOf(t, dir, "cat")
+		if !ok {
+			t.Fatalf("cat not invoked")
+		}
+		assertDashDashBeforePositional(t, argv, wantObj)
+	})
+
+	t.Run("Put probe and rcat object path", func(t *testing.T) {
+		t.Parallel()
+		b, dir := newTestBlobStoreWith(t, blobFakeSpec{lsfExit: exitDirNotFound}, remote, prefix)
+		requireNoErr(t, b.Put(context.Background(), key, bytes.NewReader([]byte("body"))))
+		lsfArgv, ok := argvOf(t, dir, "lsf")
+		if !ok {
+			t.Fatalf("lsf not invoked")
+		}
+		assertDashDashBeforePositional(t, lsfArgv, wantObj)
+		rcatArgv, ok := argvOf(t, dir, "rcat")
+		if !ok {
+			t.Fatalf("rcat not invoked")
+		}
+		assertDashDashBeforePositional(t, rcatArgv, wantObj)
+	})
+
+	t.Run("Delete object path", func(t *testing.T) {
+		t.Parallel()
+		b, dir := newTestBlobStoreWith(t, blobFakeSpec{delExit: 0}, remote, prefix)
+		requireNoErr(t, b.Delete(context.Background(), key))
+		argv, ok := argvOf(t, dir, "deletefile")
+		if !ok {
+			t.Fatalf("deletefile not invoked")
+		}
+		assertDashDashBeforePositional(t, argv, wantObj)
+	})
+
+	t.Run("List root", func(t *testing.T) {
+		t.Parallel()
+		b, dir := newTestBlobStoreWith(t, blobFakeSpec{lsfOut: "blobs/a\n"}, remote, prefix)
+		_, err := b.List(context.Background(), "")
+		requireNoErr(t, err)
+		argv, ok := argvOf(t, dir, "lsf")
+		if !ok {
+			t.Fatalf("lsf not invoked")
+		}
+		assertDashDashBeforePositional(t, argv, wantRt)
+	})
 }
 
 func TestBlobsPut(t *testing.T) {
@@ -190,6 +321,15 @@ func TestBlobsPut(t *testing.T) {
 			body:    content,
 			wantErr: func(t *testing.T, err error) { requireRcloneExit(t, err, 5) },
 			// no rcat, no cat: a non-not-found probe error must abort Put.
+			wantNoRcat: true,
+		},
+		{
+			name: "present cat hard-error propagates (not swallowed)",
+			// Present per lsf, but reading the existing object hard-fails (exit 5).
+			// The present branch must propagate it, never re-interpret it or upload.
+			spec:       blobFakeSpec{lsfOut: "abc123\n", catExit: 5, catErr: "connection refused\n"},
+			body:       content,
+			wantErr:    func(t *testing.T, err error) { requireRcloneExit(t, err, 5) },
 			wantNoRcat: true,
 		},
 	}
