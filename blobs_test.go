@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // blobFakeSpec bakes the per-subcommand behavior of a stand-in rclone into a
