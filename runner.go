@@ -1,4 +1,4 @@
-// Package rclonestore implements storekit.Blobs by driving the external rclone
+// Package rclonestore implements storage.Blobs by driving the external rclone
 // binary as a context-bounded subprocess (argv exec — never a shell string,
 // never librclone/cgo).
 package rclonestore

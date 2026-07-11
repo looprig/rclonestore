@@ -28,12 +28,12 @@ const (
 // wording that varies by rclone version and backend.
 const notFoundMarker = "not found"
 
-// blobStore implements storekit.Blobs by driving the rclone binary through a
+// blobStore implements storage.Blobs by driving the rclone binary through a
 // runner. Each object's rclone path is built from the remote, the store prefix,
 // and the per-call validated key by remoteJoin, which is aware of both remote
 // forms — a named remote ("R:<path>") vs. a ":backend:" connection string
 // ("<remote>/<path>"). remote and prefix are fixed at construction; the key is a
-// validated storekit name supplied per call. The store is pure mechanism over
+// validated storage name supplied per call. The store is pure mechanism over
 // rclone — the workspace store above it owns the single-writer lease that makes
 // the Put existence-then-write sequence sound.
 type blobStore struct {
@@ -43,7 +43,7 @@ type blobStore struct {
 	connString bool // remote is a ":backend:" connection string (leading ':'), not a named remote
 }
 
-var _ storekit.Blobs = (*blobStore)(nil)
+var _ storage.Blobs = (*blobStore)(nil)
 
 // newBlobStore constructs a blobStore over an already-configured runner. Binary
 // resolution, option validation, and the remote-reachability probe live in New;
@@ -61,7 +61,7 @@ func newBlobStore(r *runner, remote, prefix string) *blobStore {
 
 // PutSourceError reports that reading the caller-supplied Put reader failed before
 // the blob could be compared against an existing object or streamed to rclone. It
-// carries the storekit key (safe to log — it is a validated canonical name) and
+// carries the storage key (safe to log — it is a validated canonical name) and
 // wraps the underlying read error.
 type PutSourceError struct {
 	Key   string
@@ -74,14 +74,14 @@ func (e *PutSourceError) Error() string {
 
 func (e *PutSourceError) Unwrap() error { return e.cause }
 
-// Put honors storekit's content-addressed conflict contract. It first probes for
+// Put honors storage's content-addressed conflict contract. It first probes for
 // an existing object:
 //
 //   - ABSENT (the common content-addressed case): stream r straight to
 //     "rclone rcat" with no buffering — the blob never lands in memory.
 //   - PRESENT: read r fully, "rclone cat" the existing object, and compare bytes.
 //     Byte-identical → success/no-op (the object is NOT re-uploaded). Different →
-//     *storekit.BlobConflictError with the original left untouched (no upload).
+//     *storage.BlobConflictError with the original left untouched (no upload).
 //
 // The present branch buffers both the incoming reader (io.ReadAll) and the existing
 // object (into memory) to compare them. This is deliberately the rare path: keys
@@ -91,7 +91,7 @@ func (e *PutSourceError) Unwrap() error { return e.cause }
 // the workspace store holds a single-writer lease over the key space, so no
 // concurrent writer exists by construction.
 func (b *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return err
 	}
 	path := b.objectPath(key)
@@ -118,18 +118,18 @@ func (b *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 	if bytes.Equal(existing.Bytes(), incoming) {
 		return nil
 	}
-	return &storekit.BlobConflictError{Key: key}
+	return &storage.BlobConflictError{Key: key}
 }
 
 // Get streams the object at key back to the caller. It runs "rclone cat" to
 // completion into an in-memory buffer and returns an independent io.ReadCloser over
 // those bytes. Buffering (rather than piping rclone's stdout through) is what lets
 // Get satisfy the contract's synchronous not-found: storetest expects Get itself —
-// not a later Read — to return *storekit.BlobNotFoundError, which is only knowable
+// not a later Read — to return *storage.BlobNotFoundError, which is only knowable
 // once rclone has exited. A missing object is classified from rclone's exit
-// code/stderr and mapped to *storekit.BlobNotFoundError.
+// code/stderr and mapped to *storage.BlobNotFoundError.
 func (b *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return nil, err
 	}
 	path := b.objectPath(key)
@@ -137,7 +137,7 @@ func (b *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 	var buf bytes.Buffer
 	if err := b.r.run(ctx, "cat", nil, []string{path}, nil, &buf); err != nil {
 		if isNotFound(err) {
-			return nil, &storekit.BlobNotFoundError{Key: key}
+			return nil, &storage.BlobNotFoundError{Key: key}
 		}
 		return nil, err
 	}
@@ -148,7 +148,7 @@ func (b *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 // object is a success (idempotent): a not-found from rclone is classified and
 // mapped to nil; every other failure propagates.
 func (b *blobStore) Delete(ctx context.Context, key string) error {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return err
 	}
 	path := b.objectPath(key)
@@ -162,10 +162,10 @@ func (b *blobStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// List returns the storekit keys of every object under the store's prefix whose key
+// List returns the storage keys of every object under the store's prefix whose key
 // begins with the caller's prefix, lexicographically ascending and duplicate-free.
 // It runs "rclone lsf --files-only -R" rooted at "<remote>:<prefix>": the emitted
-// paths are relative to that root, so they ARE the storekit keys. The caller's
+// paths are relative to that root, so they ARE the storage keys. The caller's
 // prefix is applied locally (it need not fall on a directory boundary) and is NOT
 // name-validated. The result is sorted locally — rclone's ordering is not trusted.
 // An empty store surfaces as a not-found on the root directory, which maps to an
@@ -234,7 +234,7 @@ func (b *blobStore) objectPath(key string) string {
 
 // listRoot is the recursive-listing (and startup-probe) root: the store prefix
 // appended to the remote. lsf paths under it are relative to it, i.e. they are
-// storekit keys.
+// storage keys.
 func (b *blobStore) listRoot() string {
 	return b.remoteJoin(b.prefix)
 }

@@ -1,6 +1,6 @@
 # rclonestore
 
-`rclonestore` implements storekit's **Blobs** primitive — content-addressed immutable byte
+`rclonestore` implements storage's **Blobs** primitive — content-addressed immutable byte
 objects — by **exec'ing the external `rclone` binary** (`rcat`/`cat`/`deletefile`/`lsf`),
 giving looprig's workspace store a cloud-agnostic backend across any of rclone's many local
 and cloud remotes without ever linking librclone (whose dependency tree would defeat the
@@ -21,7 +21,7 @@ s, err := rclonestore.New(rclonestore.Options{
 if err != nil {
     return err // *OptionsError | *BinaryError | *ProbeError
 }
-// s is a storekit.Blobs: Put / Get / Delete / List.
+// s is a storage.Blobs: Put / Get / Delete / List.
 ```
 
 `New` fails fast (fail-secure) if the configuration is invalid, the binary is missing, or the
@@ -85,17 +85,17 @@ All errors are typed; classify with `errors.As`.
 - `*ProbeError` — the startup reachability probe failed (wraps the underlying `*RcloneError`).
 - `*RcloneError` — a failed rclone invocation (non-zero exit, start failure, or ctx kill).
 - `*PutSourceError` — reading the caller's `Put` reader failed.
-- storekit's `*BlobNotFoundError`, `*BlobConflictError`, `*InvalidNameError` per the Blobs contract.
+- storage's `*BlobNotFoundError`, `*BlobConflictError`, `*InvalidNameError` per the Blobs contract.
 
 ## Testing
 
 ```sh
 GOWORK=off make check                          # gofmt + vet + gosec + race unit tests
-GOWORK=off go test -tags integration -race ./... # storekit Blobs conformance vs. real rclone
+GOWORK=off go test -tags integration -race ./... # storage Blobs conformance vs. real rclone
 ```
 
 The unit tests drive a generated fake `rclone` (per-test `#!/bin/sh` script) and never touch
-the network. The **conformance** suite (`//go:build integration`) runs storekit's
+the network. The **conformance** suite (`//go:build integration`) runs storage's
 `storetest.TestBlobs` against a **real** `rclone` using the LOCAL backend
 (`:local:<temp dir>`) — no cloud credentials — and **skips** (never fails) when `rclone` is
 not on PATH. It is the harness that validates the not-found exit-code classification (3/4 plus

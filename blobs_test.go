@@ -137,7 +137,7 @@ func newTestBlobStore(t *testing.T, spec blobFakeSpec) (*blobStore, string) {
 
 func TestBlobStoreImplementsBlobs(t *testing.T) {
 	t.Parallel()
-	var _ storekit.Blobs = (*blobStore)(nil)
+	var _ storage.Blobs = (*blobStore)(nil)
 }
 
 // TestObjectPathForms pins the remote-form-aware path construction for BOTH remote
@@ -584,8 +584,8 @@ func TestBlobsList(t *testing.T) {
 }
 
 // TestBlobsInvalidKeyNeverExecs asserts that every write/read method validates the
-// key with storekit.ValidateName BEFORE any subprocess runs: an invalid key yields
-// *storekit.InvalidNameError and the fake rclone is never invoked (no argv.* file).
+// key with storage.ValidateName BEFORE any subprocess runs: an invalid key yields
+// *storage.InvalidNameError and the fake rclone is never invoked (no argv.* file).
 func TestBlobsInvalidKeyNeverExecs(t *testing.T) {
 	t.Parallel()
 
@@ -626,7 +626,7 @@ func TestBlobsInvalidKeyNeverExecs(t *testing.T) {
 				b, dir := newTestBlobStore(t, blobFakeSpec{})
 
 				err := m.call(b, bad.value)
-				var ine *storekit.InvalidNameError
+				var ine *storage.InvalidNameError
 				if !errors.As(err, &ine) {
 					t.Fatalf("%s(%q) = %v, want *InvalidNameError", m.name, bad.value, err)
 				}
@@ -694,7 +694,7 @@ func requireNoErr(t *testing.T, err error) {
 
 func requireBlobConflict(t *testing.T, err error, key string) {
 	t.Helper()
-	var bc *storekit.BlobConflictError
+	var bc *storage.BlobConflictError
 	if !errors.As(err, &bc) {
 		t.Fatalf("error = %v, want *BlobConflictError", err)
 	}
@@ -705,7 +705,7 @@ func requireBlobConflict(t *testing.T, err error, key string) {
 
 func requireBlobNotFound(t *testing.T, err error, key string) {
 	t.Helper()
-	var nf *storekit.BlobNotFoundError
+	var nf *storage.BlobNotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("error = %v, want *BlobNotFoundError", err)
 	}

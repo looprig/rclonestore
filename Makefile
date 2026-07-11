@@ -17,7 +17,7 @@ vet:
 
 # gosec scans for security issues (notably the G204 argv exec in runner.go, which
 # carries a reviewed #nosec). It is NOT a module dependency — CLAUDE.md forbids
-# adding anything beyond storekit to go.mod — so it is invoked as an external
+# adding anything beyond storage to go.mod — so it is invoked as an external
 # binary resolved from PATH or GOPATH/bin. If neither has it, the target warns and
 # skips so `make check` stays green where gosec is not installed; install with:
 #   go install github.com/securego/gosec/v2/cmd/gosec@latest

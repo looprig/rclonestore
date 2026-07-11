@@ -52,14 +52,14 @@ type Options struct {
 	Timeout time.Duration
 }
 
-// Store is a storekit.Blobs backed by the external rclone binary. It embeds the
-// unexported blobStore, so a Store IS-A storekit.Blobs (Put/Get/Delete/List are
+// Store is a storage.Blobs backed by the external rclone binary. It embeds the
+// unexported blobStore, so a Store IS-A storage.Blobs (Put/Get/Delete/List are
 // promoted). Construct one with New.
 type Store struct {
 	*blobStore
 }
 
-var _ storekit.Blobs = (*Store)(nil)
+var _ storage.Blobs = (*Store)(nil)
 
 // New validates opts, resolves the rclone binary, and probes that the remote is
 // reachable before returning a Store — failing loudly (fail-secure) at
@@ -143,7 +143,7 @@ func validateRemote(remote string) error {
 // validatePrefix accepts an empty prefix or a safe relative path fragment: no
 // leading/trailing '/', no empty, "." or ".." segment, no NUL. The prefix is
 // operator config (not an untrusted key), so segment bytes are otherwise
-// unrestricted — the storekit key appended per call carries the strict grammar.
+// unrestricted — the storage key appended per call carries the strict grammar.
 func validatePrefix(prefix string) error {
 	if prefix == "" {
 		return nil

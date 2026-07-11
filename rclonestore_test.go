@@ -166,7 +166,7 @@ func TestNewProbe(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New = %v, want success", err)
 			}
-			var _ storekit.Blobs = s
+			var _ storage.Blobs = s
 			if cerr := s.Close(); cerr != nil {
 				t.Errorf("Close() = %v, want nil", cerr)
 			}

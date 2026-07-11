@@ -13,7 +13,7 @@ import (
 //
 //   - Subcommand — the rclone subcommand (e.g. "rcat", "cat", "lsf", "deletefile").
 //   - Args       — the subcommand's own flags (the subflags). It NEVER contains the
-//     positional path arguments (which embed the remote name and the storekit key)
+//     positional path arguments (which embed the remote name and the storage key)
 //     nor the global --config path (which points at a file that may hold remote
 //     credentials). The caller passes only non-secret subflags.
 //   - ExitCode   — the process exit status; -1 for a start failure or a signal kill.
