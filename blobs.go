@@ -41,22 +41,32 @@ type blobStore struct {
 	remote     string
 	prefix     string
 	connString bool // remote is a ":backend:" connection string (leading ':'), not a named remote
+	paths      []string
 }
 
 var _ storage.Blobs = (*blobStore)(nil)
+var _ storage.PathReporter = (*blobStore)(nil)
 
 // newBlobStore constructs a blobStore over an already-configured runner. Binary
 // resolution, option validation, and the remote-reachability probe live in New;
 // this constructor takes the already-resolved remote and prefix directly and
 // derives the remote form (named vs. connection string) from the remote's leading
 // byte.
-func newBlobStore(r *runner, remote, prefix string) *blobStore {
+func newBlobStore(r *runner, remote, prefix string, paths []string) *blobStore {
 	return &blobStore{
 		r:          r,
 		remote:     remote,
 		prefix:     prefix,
 		connString: strings.HasPrefix(remote, ":"),
+		paths:      append([]string(nil), paths...),
 	}
+}
+
+// StoragePaths returns the canonical local filesystem roots used by this blob
+// provider. Remote backends return nil. The result is a defensive copy so callers
+// cannot mutate the provider's construction-time view.
+func (b *blobStore) StoragePaths() []string {
+	return append([]string(nil), b.paths...)
 }
 
 // PutSourceError reports that reading the caller-supplied Put reader failed before

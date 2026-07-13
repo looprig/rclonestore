@@ -3,10 +3,16 @@ package rclonestore
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/looprig/storage"
@@ -50,6 +56,11 @@ type Options struct {
 	// Timeout optionally bounds every rclone invocation (including the startup
 	// probe). Zero means each call is bounded only by the caller's context.
 	Timeout time.Duration
+	// PersistencePaths declares local filesystem roots used by the backend. Inline
+	// :local: remotes are discovered automatically, so this is primarily for named
+	// remotes, which are never introspected. Entries are already-effective roots;
+	// Prefix is not appended to them.
+	PersistencePaths []string
 }
 
 // Store is a storage.Blobs backed by the external rclone binary. It embeds the
@@ -60,6 +71,7 @@ type Store struct {
 }
 
 var _ storage.Blobs = (*Store)(nil)
+var _ storage.PathReporter = (*Store)(nil)
 
 // New validates opts, resolves the rclone binary, and probes that the remote is
 // reachable before returning a Store — failing loudly (fail-secure) at
@@ -81,6 +93,10 @@ func New(opts Options) (*Store, error) {
 	if opts.Timeout < 0 {
 		return nil, &OptionsError{Field: "Timeout", Rule: "must not be negative"}
 	}
+	paths, err := resolveStoragePaths(opts)
+	if err != nil {
+		return nil, err
+	}
 
 	name := opts.Binary
 	if name == "" {
@@ -92,12 +108,113 @@ func New(opts Options) (*Store, error) {
 	}
 
 	r := &runner{binary: resolved, configPath: opts.ConfigPath, timeout: opts.Timeout}
-	bs := newBlobStore(r, opts.Remote, opts.Prefix)
+	bs := newBlobStore(r, opts.Remote, opts.Prefix, paths)
 
 	if err := probe(bs); err != nil {
 		return nil, err
 	}
 	return &Store{blobStore: bs}, nil
+}
+
+// resolveStoragePaths freezes the local persistence roots described by opts.
+// Named and non-local inline remotes are opaque unless the caller explicitly
+// declares paths; rclone configuration is never inspected.
+func resolveStoragePaths(opts Options) ([]string, error) {
+	candidates := append([]string(nil), opts.PersistencePaths...)
+	if localRoot, ok := inlineLocalRoot(opts.Remote); ok {
+		if localRoot == "" {
+			localRoot = "."
+		} else {
+			localRoot = filepath.FromSlash(localRoot)
+		}
+		if opts.Prefix != "" {
+			localRoot = filepath.Join(localRoot, filepath.FromSlash(opts.Prefix))
+		}
+		candidates = append(candidates, localRoot)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	paths := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		canonical, err := canonicalizePersistencePath(candidate)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, canonical)
+	}
+	sort.Strings(paths)
+	deduplicated := paths[:0]
+	for _, path := range paths {
+		if len(deduplicated) == 0 || path != deduplicated[len(deduplicated)-1] {
+			deduplicated = append(deduplicated, path)
+		}
+	}
+	return deduplicated, nil
+}
+
+// inlineLocalRoot returns the path portion of an exact inline local backend.
+// Backend parameters are deliberately discarded and never carried into errors.
+func inlineLocalRoot(remote string) (string, bool) {
+	spec := connStringRe.FindString(remote)
+	if spec == "" {
+		return "", false
+	}
+	backendSpec := strings.TrimSuffix(strings.TrimPrefix(spec, ":"), ":")
+	backend, _, _ := strings.Cut(backendSpec, ",")
+	if backend != "local" {
+		return "", false
+	}
+	return remote[len(spec):], true
+}
+
+// canonicalizePersistencePath resolves symlinks through the nearest existing
+// ancestor while preserving a not-yet-created suffix. Lstat is intentional: it
+// distinguishes an existing broken symlink from an ordinary nonexistent leaf.
+func canonicalizePersistencePath(path string) (string, error) {
+	if path == "" {
+		return "", &PersistencePathError{Path: path, Rule: "must not be empty"}
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", &PersistencePathError{Path: path, Rule: "must be an absolute filesystem path", cause: err}
+	}
+
+	current := filepath.Clean(abs)
+	var suffix []string
+	for {
+		_, lstatErr := os.Lstat(current)
+		if lstatErr == nil {
+			resolved, evalErr := filepath.EvalSymlinks(current)
+			if evalErr != nil {
+				return "", &PersistencePathError{Path: path, Rule: "must not contain a broken symlink", cause: evalErr}
+			}
+			if len(suffix) > 0 {
+				info, statErr := os.Stat(resolved)
+				if statErr != nil {
+					return "", &PersistencePathError{Path: path, Rule: "existing ancestor must be a directory", cause: statErr}
+				}
+				if !info.IsDir() {
+					cause := &os.PathError{Op: "resolve", Path: resolved, Err: syscall.ENOTDIR}
+					return "", &PersistencePathError{Path: path, Rule: "existing ancestor must be a directory", cause: cause}
+				}
+			}
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(lstatErr, fs.ErrNotExist) {
+			return "", &PersistencePathError{Path: path, Rule: "cannot resolve filesystem path", cause: lstatErr}
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", &PersistencePathError{Path: path, Rule: "cannot find an existing ancestor", cause: lstatErr}
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
 }
 
 // Close releases resources held by the Store. rclone is driven per-call as a

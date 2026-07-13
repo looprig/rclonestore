@@ -5,6 +5,22 @@ import (
 	"strings"
 )
 
+// PersistencePathError reports an invalid local filesystem root declared by the
+// caller or derived from an inline local remote. Path contains only the local
+// filesystem portion, never a named remote or inline backend parameters.
+type PersistencePathError struct {
+	Path string
+	Rule string
+
+	cause error
+}
+
+func (e *PersistencePathError) Error() string {
+	return "rclonestore: invalid persistence path " + strconv.Quote(e.Path) + ": " + e.Rule
+}
+
+func (e *PersistencePathError) Unwrap() error { return e.cause }
+
 // RcloneError reports a failed rclone invocation: a non-zero exit, a start
 // failure, or a subprocess killed by its context deadline/cancellation. Callers
 // classify with errors.As.

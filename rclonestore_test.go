@@ -5,12 +5,207 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/looprig/storage"
 )
+
+var _ storage.PathReporter = (*Store)(nil)
+var _ storage.PathReporter = (*blobStore)(nil)
+
+func canonicalExistingTestPath(t *testing.T, path string) string {
+	t.Helper()
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", path, err)
+	}
+	return canonical
+}
+
+func TestNewStoragePaths(t *testing.T) {
+	t.Parallel()
+
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	workingDir, err = filepath.EvalSymlinks(workingDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(working directory): %v", err)
+	}
+
+	tests := []struct {
+		name string
+		opts func(t *testing.T) (Options, []string)
+	}{
+		{
+			name: "empty inline local path is current working directory",
+			opts: func(t *testing.T) (Options, []string) {
+				return Options{Remote: ":local:"}, []string{workingDir}
+			},
+		},
+		{
+			name: "inline local absolute root",
+			opts: func(t *testing.T) (Options, []string) {
+				root := t.TempDir()
+				return Options{Remote: ":local:" + root}, []string{canonicalExistingTestPath(t, root)}
+			},
+		},
+		{
+			name: "inline local includes prefix",
+			opts: func(t *testing.T) (Options, []string) {
+				root := t.TempDir()
+				canonicalRoot := canonicalExistingTestPath(t, root)
+				return Options{Remote: ":local:" + root, Prefix: "blobs/v1"}, []string{filepath.Join(canonicalRoot, "blobs", "v1")}
+			},
+		},
+		{
+			name: "non-local inline remote has no automatic path",
+			opts: func(t *testing.T) (Options, []string) {
+				return Options{Remote: ":s3,provider=Minio:/bucket"}, nil
+			},
+		},
+		{
+			name: "named remote has no automatic path",
+			opts: func(t *testing.T) (Options, []string) {
+				return Options{Remote: "named"}, nil
+			},
+		},
+		{
+			name: "named remote accepts declared path",
+			opts: func(t *testing.T) (Options, []string) {
+				root := t.TempDir()
+				return Options{Remote: "named", Prefix: "not-appended", PersistencePaths: []string{root}}, []string{canonicalExistingTestPath(t, root)}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			bin := writeBlobFake(t, dir, blobFakeSpec{lsfExit: 0})
+			opts, want := tt.opts(t)
+			opts.Binary = bin
+
+			s, err := New(opts)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if got := s.StoragePaths(); !reflect.DeepEqual(got, want) {
+				t.Errorf("StoragePaths() = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestNewStoragePathsCanonicalization(t *testing.T) {
+	t.Parallel()
+
+	realRoot := t.TempDir()
+	canonicalRealRoot := canonicalExistingTestPath(t, realRoot)
+	container := t.TempDir()
+	alias := filepath.Join(container, "alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	wantTail := filepath.Join(canonicalRealRoot, "new", "tail")
+	second := filepath.Join(canonicalRealRoot, "z-second")
+	dirs := []string{second, filepath.Join(alias, "new", "tail"), wantTail}
+
+	dir := t.TempDir()
+	bin := writeBlobFake(t, dir, blobFakeSpec{lsfExit: 0})
+	s, err := New(Options{
+		Remote:           ":local:" + filepath.Join(alias, "new"),
+		Prefix:           "tail",
+		PersistencePaths: dirs,
+		Binary:           bin,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	want := []string{wantTail, second}
+	if got := s.StoragePaths(); !reflect.DeepEqual(got, want) {
+		t.Errorf("StoragePaths() = %v, want sorted and deduplicated %v", got, want)
+	}
+}
+
+func TestStoragePathsDefensiveCopy(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	canonicalRoot := canonicalExistingTestPath(t, root)
+	paths := []string{root}
+	dir := t.TempDir()
+	bin := writeBlobFake(t, dir, blobFakeSpec{lsfExit: 0})
+	s, err := New(Options{Remote: "named", PersistencePaths: paths, Binary: bin})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	paths[0] = t.TempDir()
+	first := s.StoragePaths()
+	first[0] = t.TempDir()
+	if got := s.StoragePaths(); !reflect.DeepEqual(got, []string{canonicalRoot}) {
+		t.Errorf("StoragePaths() after mutations = %v, want [%s]", got, canonicalRoot)
+	}
+}
+
+func TestNewPersistencePathErrors(t *testing.T) {
+	t.Parallel()
+
+	container := t.TempDir()
+	missing := filepath.Join(container, "missing")
+	broken := filepath.Join(container, "broken")
+	if err := os.Symlink(missing, broken); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	regular := filepath.Join(container, "regular")
+	if err := os.WriteFile(regular, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		opts       Options
+		wantUnwrap bool
+		noLeak     string
+	}{
+		{name: "empty declared path", opts: Options{Remote: "named", PersistencePaths: []string{""}}},
+		{name: "broken symlink", opts: Options{Remote: "named", PersistencePaths: []string{filepath.Join(broken, "tail")}}, wantUnwrap: true},
+		{name: "regular file ancestor", opts: Options{Remote: "named", PersistencePaths: []string{filepath.Join(regular, "tail")}}, wantUnwrap: true},
+		{
+			name:       "derived path does not leak backend parameters",
+			opts:       Options{Remote: ":local,secret=LEAKME:" + filepath.Join(broken, "tail")},
+			wantUnwrap: true,
+			noLeak:     "LEAKME",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(tt.opts)
+			var pe *PersistencePathError
+			if !errors.As(err, &pe) {
+				t.Fatalf("New = %v, want *PersistencePathError", err)
+			}
+			if tt.wantUnwrap && errors.Unwrap(pe) == nil {
+				t.Error("PersistencePathError.Unwrap() = nil, want filesystem cause")
+			}
+			if tt.noLeak != "" && strings.Contains(err.Error(), tt.noLeak) {
+				t.Fatalf("PersistencePathError leaks remote parameters: %q", err.Error())
+			}
+		})
+	}
+}
 
 // TestNewOptionsValidation covers the pre-exec validation: a bad Remote, Prefix,
 // or Timeout is rejected with a typed *OptionsError naming the offending field —
@@ -178,7 +373,7 @@ func TestNewProbe(t *testing.T) {
 			if !containsStr(argv, "--max-depth") || !containsStr(argv, "0") {
 				t.Errorf("probe lsf missing --max-depth 0; argv=%v", argv)
 			}
-			assertDashDashBeforePositional(t, argv, newBlobStore(nil, tt.remote, "").listRoot())
+			assertDashDashBeforePositional(t, argv, newBlobStore(nil, tt.remote, "", nil).listRoot())
 		})
 	}
 }

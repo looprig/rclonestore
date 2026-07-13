@@ -125,7 +125,7 @@ func newTestBlobStoreWith(t *testing.T, spec blobFakeSpec, remote, prefix string
 	t.Helper()
 	dir := t.TempDir()
 	bin := writeBlobFake(t, dir, spec)
-	return newBlobStore(&runner{binary: bin}, remote, prefix), dir
+	return newBlobStore(&runner{binary: bin}, remote, prefix, nil), dir
 }
 
 // newTestBlobStore is newTestBlobStoreWith for the default named-remote fixture
@@ -183,7 +183,7 @@ func TestObjectPathForms(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			b := newBlobStore(nil, tt.remote, tt.prefix)
+			b := newBlobStore(nil, tt.remote, tt.prefix, nil)
 			if got := b.objectPath(tt.key); got != tt.wantObj {
 				t.Errorf("objectPath(%q) = %q, want %q", tt.key, got, tt.wantObj)
 			}
