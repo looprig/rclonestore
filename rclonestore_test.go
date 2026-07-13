@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -32,10 +31,32 @@ func canonicalExistingTestPath(t *testing.T, path string) string {
 func requireSymlink(t *testing.T, target, link string) {
 	t.Helper()
 	if err := os.Symlink(target, link); err != nil {
-		if runtime.GOOS == "windows" || errors.Is(err, fs.ErrPermission) {
+		if symlinkUnavailable(err) {
 			t.Skipf("symlink creation is unavailable: %v", err)
 		}
 		t.Fatalf("Symlink(%q, %q): %v", target, link, err)
+	}
+}
+
+func TestSymlinkUnavailable(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "permission denied is unavailable", err: &os.LinkError{Op: "symlink", Old: "target", New: "link", Err: fs.ErrPermission}, want: true},
+		{name: "missing parent is fixture failure", err: &os.LinkError{Op: "symlink", Old: "target", New: "link", Err: fs.ErrNotExist}},
+		{name: "invalid path is fixture failure", err: &os.LinkError{Op: "symlink", Old: "target", New: "link", Err: fs.ErrInvalid}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := symlinkUnavailable(tt.err); got != tt.want {
+				t.Errorf("symlinkUnavailable(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 
