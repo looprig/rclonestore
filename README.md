@@ -14,9 +14,10 @@ It depends only on the Go standard library and `github.com/looprig/storage`.
 
 ```go
 s, err := rclonestore.New(rclonestore.Options{
-    Remote:  "myremote",       // a named rclone remote, OR a :backend: connection string
-    Prefix:  "workspaces/v1",  // optional path prefix under the remote
-    Timeout: 30 * time.Second, // optional per-call bound
+	Remote:           "myremote",       // a named rclone remote, OR a :backend: connection string
+	Prefix:           "workspaces/v1",  // optional path prefix under the remote
+	PersistencePaths: []string{"/data/workspaces/v1"}, // only when a named remote persists locally
+	Timeout:          30 * time.Second, // optional per-call bound
 })
 if err != nil {
     return err // *OptionsError | *BinaryError | *ProbeError
@@ -30,13 +31,14 @@ persistent connection, so its `Close` is a documented no-op.
 
 ### Options
 
-| Field        | Meaning |
-| ------------ | ------- |
-| `Remote`     | **Required.** A named rclone remote **or** a `:backend:` connection string (see below). |
-| `Prefix`     | Optional path fragment under the remote. Must be a safe relative path: no leading/trailing `/`, no empty, `.` or `..` segment. |
-| `Binary`     | rclone executable; default `"rclone"`, resolved via `exec.LookPath`. |
-| `ConfigPath` | Optional `--config` path. Referenced by path only — never opened, parsed, copied, or logged (it may hold remote secrets). |
-| `Timeout`    | Optional bound on every rclone invocation (including the startup probe). Zero means each call is bounded only by the caller's context. |
+| Field              | Meaning |
+| ------------------ | ------- |
+| `Remote`           | **Required.** A named rclone remote **or** a `:backend:` connection string (see below). |
+| `Prefix`           | Optional path fragment under the remote. Must be a safe relative path: no leading/trailing `/`, no empty, `.` or `..` segment. |
+| `PersistencePaths` | Optional local filesystem roots used by the backend. Inline `:local:` roots are discovered automatically; named remotes are never introspected. Entries are exact effective roots, so `Prefix` is not appended. |
+| `Binary`           | rclone executable; default `"rclone"`, resolved via `exec.LookPath`. |
+| `ConfigPath`       | Optional `--config` path. Referenced by path only — never opened, parsed, copied, or logged (it may hold remote secrets). |
+| `Timeout`          | Optional bound on every rclone invocation (including the startup probe). Zero means each call is bounded only by the caller's context. |
 
 ### The two remote forms
 
@@ -53,6 +55,25 @@ accordingly (a hardcoded colon would break the connection-string form):
 An empty `Prefix` collapses cleanly (no spurious slash). Complex backends whose inline
 parameter values contain unescaped colons are better expressed as a **named remote** in the
 rclone config than as a connection string.
+
+### Local persistence paths
+
+`Store` implements storage's optional `PathReporter` capability. `StoragePaths` returns the
+canonical local roots that hold blobs, allowing workspace owners to reject unsafe overlap
+with their own directories.
+
+Inline `:local:` remotes are detected without invoking rclone or reading configuration. Their
+effective root includes `Prefix`; for example `Remote: ":local:/data"` with
+`Prefix: "workspaces/v1"` reports `/data/workspaces/v1`. Other inline backends and ordinary
+named remotes report no automatic path.
+
+A named remote can itself be configured as a local backend, but rclonestore deliberately
+does not inspect its config because it may contain credentials. In that case the caller must
+provide the exact effective root through `PersistencePaths`. Explicit paths are unioned with
+any automatically detected local root, canonicalized through the nearest existing ancestor,
+sorted, and deduplicated. A directory that does not exist yet is supported; a broken symlink
+or invalid ancestor returns `*PersistencePathError`. Both the option slice and every returned
+slice are defensively copied.
 
 ### Startup probe
 
@@ -81,6 +102,8 @@ wrapping the credential-safe `*RcloneError`.
 All errors are typed; classify with `errors.As`.
 
 - `*OptionsError` — invalid `Remote`/`Prefix`/`Timeout` (from `New`, before any exec).
+- `*PersistencePathError` — a declared or automatically derived local persistence root could
+  not be canonicalized (wraps an underlying filesystem cause when applicable).
 - `*BinaryError` — the rclone binary could not be resolved on PATH (wraps the `exec.LookPath` cause).
 - `*ProbeError` — the startup reachability probe failed (wraps the underlying `*RcloneError`).
 - `*RcloneError` — a failed rclone invocation (non-zero exit, start failure, or ctx kill).
