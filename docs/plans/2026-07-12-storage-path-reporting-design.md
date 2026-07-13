@@ -70,9 +70,14 @@ time assertions cover both types.
 
 ### Inline local remotes
 
-The already-validated connection string is split at the colon terminating its
-backend specification. The backend name is the portion before the first comma;
-only the exact backend `local` is filesystem-backed.
+The connection string is scanned for the unquoted colon terminating its backend
+specification. Single- and double-quoted parameter values may contain colons and
+commas; doubling the active quote escapes it. Unterminated quoted values are
+rejected with a credential-safe `OptionsError`. The scanner returns one parsed
+representation used by validation and path discovery, so backend parameters are
+discarded before filesystem handling. The backend name is the portion before the
+first comma; only the exact backend `local` is filesystem-backed. Colons after
+the spec delimiter remain part of the path.
 
 For `:local:/data` with prefix `blobs/v1`, the reported candidate is
 `/data/blobs/v1`. Rclone paths use slash separators, so the remote path and
@@ -103,11 +108,13 @@ unchanged. This supports a fresh store whose directory will be created by the
 first `Put`, while still making aliases through existing symlinked parents
 comparable.
 
-The walk stops at the first existing ancestor. Errors other than not-existence,
-including a broken symlink or a non-directory ancestor, fail construction. Empty
-explicit declarations fail rather than silently disappearing. Failures return a
-typed `*PersistencePathError` that carries the affected explicit filesystem path
-and unwraps the underlying cause. Automatically derived local paths are reported
+The walk stops at the first existing ancestor. That ancestor must be a directory
+even when it is the exact candidate; an exact regular file or symlink to a file
+is rejected. Errors other than not-existence, including a broken symlink or a
+non-directory ancestor, fail construction. Empty explicit declarations fail
+rather than silently disappearing. Failures return a typed
+`*PersistencePathError` that carries the affected explicit filesystem path and
+unwraps the underlying cause. Automatically derived local paths are reported
 without echoing the credential-bearing `Remote` value.
 
 Paths are frozen before binary resolution and the startup probe. The internal
@@ -137,11 +144,15 @@ Table-driven parallel tests use the existing fake rclone binary and cover:
 
 - compile-time `storage.PathReporter` satisfaction for `Store` and `blobStore`;
 - inline local roots with and without a prefix;
+- quoted inline parameters containing colons, commas, doubled quote escapes, and
+  credentials that never enter paths or errors;
+- unterminated quoted parameters returning credential-safe `OptionsError`;
 - `:local:` resolving from the current working directory;
 - non-local inline and named remotes reporting no automatic path;
 - named remotes with explicit paths;
 - union, canonical sort, and deduplication;
 - symlinked existing ancestors with nonexistent tails;
+- exact regular files and symlinks to files being rejected;
 - empty, broken, and otherwise invalid declared paths returning the typed error;
 - mutation of both input options and returned slices not affecting stored paths.
 

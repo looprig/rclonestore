@@ -273,3 +273,42 @@ Confirm line by line that:
 
 If review finds an issue, use a new RED→GREEN test cycle and commit the focused
 correction. If no issue is found, do not create an empty commit.
+
+### Task 5: Address connection-string and exact-file review findings
+
+**Files:**
+- Modify: `rclonestore.go`
+- Modify: `rclonestore_test.go`
+- Modify: `README.md`
+- Modify: `docs/plans/2026-07-12-storage-path-reporting-design.md`
+
+**Step 1: Write focused failing tests**
+
+Add table cases proving that single- and double-quoted parameter values can
+contain colons/commas, doubled quotes are escaped, the path after the delimiter
+retains colons, and no credential marker reaches paths or errors. Add malformed
+unterminated-quote cases. Add exact regular-file and symlink-to-file rejection
+cases, and make symlink fixture setup skip narrowly when the platform cannot
+create links.
+
+**Step 2: Verify RED**
+
+```bash
+GOWORK=off GOCACHE=/private/tmp/rclonestore-gocache go test -race ./... -run 'TestNewStoragePaths|TestNewPersistencePathErrors|TestNewOptionsValidation|TestNewOptionsErrorNoLeak'
+```
+
+Expected: quoted remotes are split at a colon inside their parameter, unterminated
+quotes proceed to binary resolution, and exact files are accepted.
+
+**Step 3: Implement the minimal fixes**
+
+Replace connection-string regex parsing with a credential-safe scanner that
+tracks single/double quote state and doubled-quote escapes. Return one parsed
+remote used by validation and inline-local discovery. Require the resolved
+existing candidate to be a directory regardless of whether a nonexistent suffix
+was accumulated.
+
+**Step 4: Verify GREEN and all gates**
+
+Run the focused command, full race suite, `make check`, integration race suite,
+cross-platform compile, formatting, vet, and diff checks. Commit the review fix.

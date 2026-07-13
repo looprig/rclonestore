@@ -47,14 +47,16 @@ accordingly (a hardcoded colon would break the connection-string form):
 
 - **Named remote** — a config alias matching `^[A-Za-z0-9_-]+$` (e.g. `myremote`). The object
   path joins with a colon: `myremote:` + `prefix/key` → `myremote:prefix/key`.
-- **Connection string** — an inline spec beginning with `:`, matching
-  `^:[a-z0-9]+(,<params>…)?:` (e.g. `:local:/data`, `:s3,provider=Minio:/bucket`). The backend
-  spec already ends with a colon, so the path is appended with a slash instead:
+- **Connection string** — an inline spec beginning with `:` and a lowercase alphanumeric
+  backend (e.g. `:local:/data`, `:s3,provider=Minio:/bucket`). The backend spec already ends
+  with a colon, so the path is appended with a slash instead:
   `:local:/data` + `prefix/key` → `:local:/data/prefix/key`.
 
-An empty `Prefix` collapses cleanly (no spurious slash). Complex backends whose inline
-parameter values contain unescaped colons are better expressed as a **named remote** in the
-rclone config than as a connection string.
+The parser finds the spec-ending unquoted colon. Parameter values containing colons or commas
+must use rclone's single- or double-quoted form; doubling the active quote escapes it. For
+example, `:local,token='https://user:pass@host':/data` still has `/data` as its local path.
+Unterminated quoted values are rejected without echoing the credential-bearing remote.
+Colons after the spec delimiter belong to the path. An empty `Prefix` collapses cleanly.
 
 ### Local persistence paths
 
@@ -72,8 +74,8 @@ does not inspect its config because it may contain credentials. In that case the
 provide the exact effective root through `PersistencePaths`. Explicit paths are unioned with
 any automatically detected local root, canonicalized through the nearest existing ancestor,
 sorted, and deduplicated. A directory that does not exist yet is supported; a broken symlink
-or invalid ancestor returns `*PersistencePathError`. Both the option slice and every returned
-slice are defensively copied.
+or path that resolves to a regular file returns `*PersistencePathError`. Both the option slice
+and every returned slice are defensively copied.
 
 ### Startup probe
 

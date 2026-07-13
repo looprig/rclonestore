@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -25,6 +27,16 @@ func canonicalExistingTestPath(t *testing.T, path string) string {
 		t.Fatalf("EvalSymlinks(%q): %v", path, err)
 	}
 	return canonical
+}
+
+func requireSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS == "windows" || errors.Is(err, fs.ErrPermission) {
+			t.Skipf("symlink creation is unavailable: %v", err)
+		}
+		t.Fatalf("Symlink(%q, %q): %v", target, link, err)
+	}
 }
 
 func TestNewStoragePaths(t *testing.T) {
@@ -65,6 +77,28 @@ func TestNewStoragePaths(t *testing.T) {
 			},
 		},
 		{
+			name: "single-quoted parameters may contain credentials colons and commas",
+			opts: func(t *testing.T) (Options, []string) {
+				root := t.TempDir()
+				return Options{Remote: ":local,secret='https://user:LEAKME@host/a,b':" + root}, []string{canonicalExistingTestPath(t, root)}
+			},
+		},
+		{
+			name: "double-quoted parameters support doubled quote escaping",
+			opts: func(t *testing.T) (Options, []string) {
+				root := t.TempDir()
+				return Options{Remote: `:local,note="a:""LEAKME,b":` + root}, []string{canonicalExistingTestPath(t, root)}
+			},
+		},
+		{
+			name: "colon in local path remains after spec delimiter",
+			opts: func(t *testing.T) (Options, []string) {
+				root := canonicalExistingTestPath(t, t.TempDir())
+				path := filepath.Join(root, "volume:part")
+				return Options{Remote: ":local:" + path}, []string{path}
+			},
+		},
+		{
 			name: "non-local inline remote has no automatic path",
 			opts: func(t *testing.T) (Options, []string) {
 				return Options{Remote: ":s3,provider=Minio:/bucket"}, nil
@@ -100,6 +134,8 @@ func TestNewStoragePaths(t *testing.T) {
 			}
 			if got := s.StoragePaths(); !reflect.DeepEqual(got, want) {
 				t.Errorf("StoragePaths() = %v, want %v", got, want)
+			} else if strings.Contains(strings.Join(got, ""), "LEAKME") {
+				t.Fatalf("StoragePaths leaks connection parameters: %v", got)
 			}
 		})
 	}
@@ -112,9 +148,7 @@ func TestNewStoragePathsCanonicalization(t *testing.T) {
 	canonicalRealRoot := canonicalExistingTestPath(t, realRoot)
 	container := t.TempDir()
 	alias := filepath.Join(container, "alias")
-	if err := os.Symlink(realRoot, alias); err != nil {
-		t.Fatalf("Symlink: %v", err)
-	}
+	requireSymlink(t, realRoot, alias)
 	wantTail := filepath.Join(canonicalRealRoot, "new", "tail")
 	second := filepath.Join(canonicalRealRoot, "z-second")
 	dirs := []string{second, filepath.Join(alias, "new", "tail"), wantTail}
@@ -163,9 +197,7 @@ func TestNewPersistencePathErrors(t *testing.T) {
 	container := t.TempDir()
 	missing := filepath.Join(container, "missing")
 	broken := filepath.Join(container, "broken")
-	if err := os.Symlink(missing, broken); err != nil {
-		t.Fatalf("Symlink: %v", err)
-	}
+	requireSymlink(t, missing, broken)
 	regular := filepath.Join(container, "regular")
 	if err := os.WriteFile(regular, []byte("not a directory"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -178,15 +210,25 @@ func TestNewPersistencePathErrors(t *testing.T) {
 		noLeak     string
 	}{
 		{name: "empty declared path", opts: Options{Remote: "named", PersistencePaths: []string{""}}},
+		{name: "exact regular file", opts: Options{Remote: "named", PersistencePaths: []string{regular}}, wantUnwrap: true},
 		{name: "broken symlink", opts: Options{Remote: "named", PersistencePaths: []string{filepath.Join(broken, "tail")}}, wantUnwrap: true},
 		{name: "regular file ancestor", opts: Options{Remote: "named", PersistencePaths: []string{filepath.Join(regular, "tail")}}, wantUnwrap: true},
 		{
 			name:       "derived path does not leak backend parameters",
-			opts:       Options{Remote: ":local,secret=LEAKME:" + filepath.Join(broken, "tail")},
+			opts:       Options{Remote: ":local,secret='https://user:LEAKME@host/a,b':" + filepath.Join(broken, "tail")},
 			wantUnwrap: true,
 			noLeak:     "LEAKME",
 		},
 	}
+
+	fileAlias := filepath.Join(container, "file-alias")
+	requireSymlink(t, regular, fileAlias)
+	tests = append(tests, struct {
+		name       string
+		opts       Options
+		wantUnwrap bool
+		noLeak     string
+	}{name: "exact symlink to regular file", opts: Options{Remote: "named", PersistencePaths: []string{fileAlias}}, wantUnwrap: true})
 
 	for _, tt := range tests {
 		tt := tt
@@ -224,6 +266,8 @@ func TestNewOptionsValidation(t *testing.T) {
 		{name: "bare colon is not a connection string", opts: Options{Remote: ":"}, wantField: "Remote"},
 		{name: "empty backend connection string", opts: Options{Remote: "::x"}, wantField: "Remote"},
 		{name: "connection string missing closing colon", opts: Options{Remote: ":local"}, wantField: "Remote"},
+		{name: "connection string unterminated single quote", opts: Options{Remote: ":local,secret='LEAKME:/data"}, wantField: "Remote"},
+		{name: "connection string unterminated double quote", opts: Options{Remote: `:local,secret="LEAKME:/data`}, wantField: "Remote"},
 		{name: "prefix leading slash", opts: Options{Remote: "myremote", Prefix: "/x"}, wantField: "Prefix"},
 		{name: "prefix trailing slash", opts: Options{Remote: "myremote", Prefix: "x/"}, wantField: "Prefix"},
 		{name: "prefix doubled slash", opts: Options{Remote: "myremote", Prefix: "a//b"}, wantField: "Prefix"},
@@ -301,15 +345,24 @@ func TestNewBinaryNotFound(t *testing.T) {
 // embed credentials) never has its value echoed into the OptionsError message.
 func TestNewOptionsErrorNoLeak(t *testing.T) {
 	t.Parallel()
-	// Malformed (no closing colon after params) so validation rejects it; carries a
-	// secret marker that must not appear in the error.
-	_, err := New(Options{Remote: ":s3,secret_access_key=LEAKME"})
-	var oe *OptionsError
-	if !errors.As(err, &oe) {
-		t.Fatalf("New = %v, want *OptionsError", err)
+	tests := []string{
+		":s3,secret_access_key=LEAKME",
+		":local,secret='https://user:LEAKME@host/path",
+		`:local,secret="https://user:LEAKME@host/path`,
 	}
-	if strings.Contains(err.Error(), "LEAKME") {
-		t.Fatalf("OptionsError leaks the remote value: %q", err.Error())
+	for _, remote := range tests {
+		remote := remote
+		t.Run(remote[:6], func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Options{Remote: remote})
+			var oe *OptionsError
+			if !errors.As(err, &oe) {
+				t.Fatalf("New = %v, want *OptionsError", err)
+			}
+			if strings.Contains(err.Error(), "LEAKME") {
+				t.Fatalf("OptionsError leaks the remote value: %q", err.Error())
+			}
+		})
 	}
 }
 

@@ -22,21 +22,16 @@ import (
 // Options.Binary is empty.
 const defaultBinary = "rclone"
 
-// Named-remote and connection-string remote forms. A remote is EITHER a named
-// rclone remote (a config alias) matching namedRemoteRe, OR an inline connection
-// string beginning with ':' whose backend spec matches connStringRe.
-//
-//   - namedRemoteRe: a config alias, e.g. "myremote" — letters, digits, '_', '-'.
-//   - connStringRe: ":<backend>[,<params>…]:" — a leading colon, a lowercase
-//     alphanumeric backend name, optional comma-separated backend parameters
-//     (their values may themselves contain colons/paths), and a closing colon that
-//     terminates the backend spec. Anything after the closing colon (a path) is
-//     the operator's and is not matched here. Examples matched: ":local:",
-//     ":local:/some/root", ":s3,provider=Minio:/bucket/prefix".
-var (
-	namedRemoteRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	connStringRe  = regexp.MustCompile(`^:[a-z0-9]+(,[^:]*)*:`)
-)
+// namedRemoteRe validates a config alias. Inline connection strings need a small
+// scanner rather than a regexp because quoted backend parameter values may contain
+// colons and commas.
+var namedRemoteRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+type parsedRemote struct {
+	connectionString bool
+	backend          string
+	path             string
+}
 
 // Options configures a rclonestore Store. Only Remote is required. No field is
 // ever logged or placed in an error verbatim: a connection-string Remote or a
@@ -84,7 +79,8 @@ var _ storage.PathReporter = (*Store)(nil)
 //     by opts.Timeout. A not-found root is treated as reachable-but-empty (a fresh
 //     store creates it on first Put); any other failure is a *ProbeError.
 func New(opts Options) (*Store, error) {
-	if err := validateRemote(opts.Remote); err != nil {
+	remote, err := parseRemote(opts.Remote)
+	if err != nil {
 		return nil, err
 	}
 	if err := validatePrefix(opts.Prefix); err != nil {
@@ -93,7 +89,7 @@ func New(opts Options) (*Store, error) {
 	if opts.Timeout < 0 {
 		return nil, &OptionsError{Field: "Timeout", Rule: "must not be negative"}
 	}
-	paths, err := resolveStoragePaths(opts)
+	paths, err := resolveStoragePaths(opts, remote)
 	if err != nil {
 		return nil, err
 	}
@@ -119,9 +115,9 @@ func New(opts Options) (*Store, error) {
 // resolveStoragePaths freezes the local persistence roots described by opts.
 // Named and non-local inline remotes are opaque unless the caller explicitly
 // declares paths; rclone configuration is never inspected.
-func resolveStoragePaths(opts Options) ([]string, error) {
+func resolveStoragePaths(opts Options, remote parsedRemote) ([]string, error) {
 	candidates := append([]string(nil), opts.PersistencePaths...)
-	if localRoot, ok := inlineLocalRoot(opts.Remote); ok {
+	if localRoot, ok := inlineLocalRoot(remote); ok {
 		if localRoot == "" {
 			localRoot = "."
 		} else {
@@ -154,19 +150,14 @@ func resolveStoragePaths(opts Options) ([]string, error) {
 	return deduplicated, nil
 }
 
-// inlineLocalRoot returns the path portion of an exact inline local backend.
-// Backend parameters are deliberately discarded and never carried into errors.
-func inlineLocalRoot(remote string) (string, bool) {
-	spec := connStringRe.FindString(remote)
-	if spec == "" {
+// inlineLocalRoot returns the already-parsed path portion of an exact inline
+// local backend. Backend parameters were discarded by parseRemote and therefore
+// cannot enter a path or filesystem error.
+func inlineLocalRoot(remote parsedRemote) (string, bool) {
+	if !remote.connectionString || remote.backend != "local" {
 		return "", false
 	}
-	backendSpec := strings.TrimSuffix(strings.TrimPrefix(spec, ":"), ":")
-	backend, _, _ := strings.Cut(backendSpec, ",")
-	if backend != "local" {
-		return "", false
-	}
-	return remote[len(spec):], true
+	return remote.path, true
 }
 
 // canonicalizePersistencePath resolves symlinks through the nearest existing
@@ -190,15 +181,13 @@ func canonicalizePersistencePath(path string) (string, error) {
 			if evalErr != nil {
 				return "", &PersistencePathError{Path: path, Rule: "must not contain a broken symlink", cause: evalErr}
 			}
-			if len(suffix) > 0 {
-				info, statErr := os.Stat(resolved)
-				if statErr != nil {
-					return "", &PersistencePathError{Path: path, Rule: "existing ancestor must be a directory", cause: statErr}
-				}
-				if !info.IsDir() {
-					cause := &os.PathError{Op: "resolve", Path: resolved, Err: syscall.ENOTDIR}
-					return "", &PersistencePathError{Path: path, Rule: "existing ancestor must be a directory", cause: cause}
-				}
+			info, statErr := os.Stat(resolved)
+			if statErr != nil {
+				return "", &PersistencePathError{Path: path, Rule: "existing path must be a directory", cause: statErr}
+			}
+			if !info.IsDir() {
+				cause := &os.PathError{Op: "resolve", Path: resolved, Err: syscall.ENOTDIR}
+				return "", &PersistencePathError{Path: path, Rule: "existing path must be a directory", cause: cause}
 			}
 			for i := len(suffix) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, suffix[i])
@@ -238,23 +227,58 @@ func probe(bs *blobStore) error {
 	return &ProbeError{cause: err}
 }
 
-// validateRemote accepts a named remote or a connection string and rejects
-// anything else. It never places the remote value in the error: a connection
-// string can embed credentials.
-func validateRemote(remote string) error {
+// parseRemote accepts a named remote or scans an inline connection string. The
+// scan stops only at an unquoted colon; single- and double-quoted parameter values
+// may contain colons/commas and escape their quote by doubling it. Errors never
+// carry the remote value because backend parameters can contain credentials.
+func parseRemote(remote string) (parsedRemote, error) {
 	if remote == "" {
-		return &OptionsError{Field: "Remote", Rule: "required"}
+		return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "required"}
 	}
 	if strings.HasPrefix(remote, ":") {
-		if !connStringRe.MatchString(remote) {
-			return &OptionsError{Field: "Remote", Rule: "malformed connection string (want :backend:[path])"}
+		quote := byte(0)
+		for i := 1; i < len(remote); i++ {
+			ch := remote[i]
+			if quote != 0 {
+				if ch == quote {
+					if i+1 < len(remote) && remote[i+1] == quote {
+						i++
+						continue
+					}
+					quote = 0
+				}
+				continue
+			}
+			switch ch {
+			case '\'', '"':
+				quote = ch
+			case ':':
+				backendSpec := remote[1:i]
+				backend, _, _ := strings.Cut(backendSpec, ",")
+				if !validBackendName(backend) {
+					return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "malformed connection string (want :backend:[path])"}
+				}
+				return parsedRemote{connectionString: true, backend: backend, path: remote[i+1:]}, nil
+			}
 		}
-		return nil
+		return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "malformed connection string (want balanced quoted parameters and :backend:[path])"}
 	}
 	if !namedRemoteRe.MatchString(remote) {
-		return &OptionsError{Field: "Remote", Rule: "not a named remote ([A-Za-z0-9_-]) or a :backend: connection string"}
+		return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "not a named remote ([A-Za-z0-9_-]) or a :backend: connection string"}
 	}
-	return nil
+	return parsedRemote{}, nil
+}
+
+func validBackendName(backend string) bool {
+	if backend == "" {
+		return false
+	}
+	for i := 0; i < len(backend); i++ {
+		if ch := backend[i]; (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // validatePrefix accepts an empty prefix or a safe relative path fragment: no
