@@ -7,6 +7,8 @@ thin, security-hardened exec adapter — nothing more.
 
 - **stdlib + `github.com/looprig/storage` ONLY. No other third-party dependency, ever.**
   Do not `go get` anything. Do not add a `require` line beyond storage.
+  (`make secure`'s staticcheck/gosec/govulncheck are PATH-resolved dev-tool binaries, not
+  go.mod dependencies — this does not contradict the rule above.)
 - **Never link librclone / cgo.** rclone is driven as a subprocess (argv exec) only. Linking
   the library would pull in a giant dependency tree and defeat the extraction.
 
