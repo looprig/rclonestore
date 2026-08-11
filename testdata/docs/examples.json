@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "repository": "rclonestore",
+  "proofSources": [
+    {
+      "id": "example-rclonestore-blob-remote-fixture",
+      "type": "executable-fixture",
+      "path": "examples/blob-remote/blob_remote_test.go",
+      "symbol": "TestExampleBlobRemote"
+    },
+    {
+      "id": "example-rclonestore-artifacts-contract-test",
+      "type": "test",
+      "path": "examples/contract_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
+    },
+    {
+      "id": "example-rclonestore-new-source",
+      "type": "source",
+      "path": "rclonestore.go",
+      "symbol": "New"
+    },
+    {
+      "id": "example-rclonestore-blob-lifecycle-source",
+      "type": "source",
+      "path": "blobs.go",
+      "symbol": "blobStore.Put"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-rclonestore-blob-remote-lifecycle",
+      "ecosystem": "go",
+      "owner": "rclonestore",
+      "sourcePath": "examples/blob-remote/blob_remote_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/rclonestore": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "A deterministic scripted rclone subprocess proves public option forwarding, immutable and idempotent blob puts, typed conflicts and missing-object errors, get/list/delete behavior, reader ownership, and idempotent Store.Close without a real remote.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The test closes every returned blob reader, calls Store.Close twice, and lets t.TempDir remove the fake executable, config, logs, state, and declared persistence path after each synchronous rclone subprocess exits.",
+      "liveGate": null,
+      "proofIds": [
+        "example-rclonestore-blob-remote-fixture",
+        "example-rclonestore-artifacts-contract-test",
+        "example-rclonestore-new-source",
+        "example-rclonestore-blob-lifecycle-source"
+      ]
+    }
+  ]
+}
