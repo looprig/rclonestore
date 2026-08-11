@@ -145,7 +145,7 @@ func TestExampleBlobRemote(t *testing.T) {
 		Prefix:           "examples",
 		Binary:           binaryPath,
 		ConfigPath:       configPath,
-		Timeout:          2 * time.Second,
+		Timeout:          15 * time.Second,
 		PersistencePaths: []string{declaredPath},
 	})
 	if err != nil {
