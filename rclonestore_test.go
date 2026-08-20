@@ -201,7 +201,7 @@ func TestStoragePathsDefensiveCopy(t *testing.T) {
 	bin := writeBlobFake(t, dir, blobFakeSpec{lsfExit: 0})
 	s, err := New(Options{Remote: "named", PersistencePaths: paths, Binary: bin})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("New: %v; rclone cause: %T: %v", err, rcloneFailureCause(err), rcloneFailureCause(err))
 	}
 
 	paths[0] = t.TempDir()

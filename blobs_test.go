@@ -667,7 +667,7 @@ func TestBlobsPutSourceError(t *testing.T) {
 	err := b.Put(context.Background(), key, &failingReader{})
 	var pse *PutSourceError
 	if !errors.As(err, &pse) {
-		t.Fatalf("Put(failing reader) = %v, want *PutSourceError", err)
+		t.Fatalf("Put(failing reader) = %v, want *PutSourceError; rclone cause: %T: %v", err, rcloneFailureCause(err), rcloneFailureCause(err))
 	}
 	if pse.Key != key {
 		t.Fatalf("PutSourceError.Key = %q, want %q", pse.Key, key)
@@ -723,6 +723,18 @@ func requireRcloneExit(t *testing.T, err error, wantExit int) {
 	if re.ExitCode != wantExit {
 		t.Fatalf("RcloneError.ExitCode = %d, want %d", re.ExitCode, wantExit)
 	}
+}
+
+// rcloneFailureCause extracts the underlying process error for test diagnostics.
+// RcloneError excludes config and positional arguments, and exec's start/exit
+// errors contain only the executable path or exit status, so this remains safe
+// even when a test remote or config carries a credential marker.
+func rcloneFailureCause(err error) error {
+	var re *RcloneError
+	if !errors.As(err, &re) {
+		return nil
+	}
+	return errors.Unwrap(re)
 }
 
 // equalStrings treats nil and empty as equal (List may return either for an empty

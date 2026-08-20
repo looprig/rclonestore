@@ -7,11 +7,16 @@
 # other Go command here (see CLAUDE.md).
 GO_DIRS := $(shell GOWORK=off go list -f '{{.Dir}}' ./...)
 
+# Most unit tests execute a short-lived fake rclone process. Keep both package
+# and in-package test scheduling serial so a high-core or PID-constrained runner
+# cannot turn that intentional subprocess coverage into fork/exec EAGAIN flakes.
+GO_TEST_CONCURRENCY := -p=1 -parallel=1
+
 test:
-	GOWORK=off go test -race ./...
+	GOWORK=off go test -race $(GO_TEST_CONCURRENCY) ./...
 
 test-integration:
-	GOWORK=off go test -tags integration -race ./...
+	GOWORK=off go test -tags integration -race $(GO_TEST_CONCURRENCY) ./...
 
 fmt:
 	gofmt -w $(GO_DIRS)
