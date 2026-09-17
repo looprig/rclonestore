@@ -394,17 +394,41 @@ func TestNewOptionsErrorNoLeak(t *testing.T) {
 func TestNewProbe(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name     string
-		spec     blobFakeSpec
-		remote   string
-		wantErr  bool // expect *ProbeError
-		wantExit int  // wrapped RcloneError exit code when wantErr
+		name          string
+		spec          blobFakeSpec
+		remote        string
+		remoteRoot    func(*testing.T) string
+		wantErr       bool // expect *ProbeError
+		wantPathError bool // expect *PersistencePathError before probing
+		wantExit      int  // wrapped RcloneError exit code when wantErr
 	}{
 		{name: "reachable empty root (exit 0)", spec: blobFakeSpec{lsfExit: 0}, remote: "myremote"},
 		{name: "root not found (exit 3) is reachable-but-empty", spec: blobFakeSpec{lsfExit: exitDirNotFound}, remote: "myremote"},
 		{name: "object not found (exit 4) is reachable-but-empty", spec: blobFakeSpec{lsfExit: exitFileNotFound}, remote: "myremote"},
-		{name: "connection-string remote reachable", spec: blobFakeSpec{lsfExit: 0}, remote: ":local:/tmp/x"},
-		{name: "unreachable (exit 5) is ProbeError", spec: blobFakeSpec{lsfExit: 5}, remote: ":local:/tmp/SECRETROOT", wantErr: true, wantExit: 5},
+		{
+			name:       "connection-string remote reachable",
+			spec:       blobFakeSpec{lsfExit: 0},
+			remoteRoot: func(t *testing.T) string { return t.TempDir() },
+		},
+		{
+			name:       "missing connection-string root reaches probe failure",
+			spec:       blobFakeSpec{lsfExit: 5},
+			remoteRoot: func(t *testing.T) string { return filepath.Join(t.TempDir(), "SECRETROOT") },
+			wantErr:    true,
+			wantExit:   5,
+		},
+		{
+			name: "not-directory connection-string root is rejected before probing",
+			spec: blobFakeSpec{lsfExit: 0},
+			remoteRoot: func(t *testing.T) string {
+				root := filepath.Join(t.TempDir(), "regular")
+				if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				return root
+			},
+			wantPathError: true,
+		},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -412,8 +436,22 @@ func TestNewProbe(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
 			bin := writeBlobFake(t, dir, tt.spec)
+			remote := tt.remote
+			if tt.remoteRoot != nil {
+				remote = ":local:" + tt.remoteRoot(t)
+			}
 
-			s, err := New(Options{Remote: tt.remote, Binary: bin})
+			s, err := New(Options{Remote: remote, Binary: bin})
+			if tt.wantPathError {
+				var pe *PersistencePathError
+				if !errors.As(err, &pe) {
+					t.Fatalf("New = %v, want *PersistencePathError", err)
+				}
+				if _, ok := argvOf(t, dir, "lsf"); ok {
+					t.Fatal("probe ran for a non-directory persistence root")
+				}
+				return
+			}
 			if tt.wantErr {
 				var pe *ProbeError
 				if !errors.As(err, &pe) {
@@ -447,7 +485,7 @@ func TestNewProbe(t *testing.T) {
 			if !containsStr(argv, "--max-depth") || !containsStr(argv, "0") {
 				t.Errorf("probe lsf missing --max-depth 0; argv=%v", argv)
 			}
-			assertDashDashBeforePositional(t, argv, newBlobStore(nil, tt.remote, "", nil).listRoot())
+			assertDashDashBeforePositional(t, argv, newBlobStore(nil, remote, "", nil).listRoot())
 		})
 	}
 }
