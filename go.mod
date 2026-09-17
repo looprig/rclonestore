@@ -1,5 +1,5 @@
 module github.com/looprig/rclonestore
 
-go 1.26.6
+go 1.26.8
 
 require github.com/looprig/storage v0.4.1
