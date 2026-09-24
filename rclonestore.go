@@ -78,6 +78,12 @@ var _ storage.PathReporter = (*Store)(nil)
 //  4. The remote root is probed with "rclone lsf --max-depth 0 -- <root>", bounded
 //     by opts.Timeout. A not-found root is treated as reachable-but-empty (a fresh
 //     store creates it on first Put); any other failure is a *ProbeError.
+//  5. The root is scanned for objects written by rclonestore <= v0.4.x, which
+//     stored each key at its bare path (v0.5.0 stores "<key>@blob"): one
+//     recursive "rclone lsf --files-only -R" of the root, bounded by
+//     opts.Timeout — the same cost as one List. A legacy object is refused with
+//     *LegacyLayoutError (errors.Is ErrLegacyLayout); there is no migration. A
+//     scan failure is a *LayoutScanError.
 func New(opts Options) (*Store, error) {
 	remote, err := parseRemote(opts.Remote)
 	if err != nil {
@@ -107,6 +113,9 @@ func New(opts Options) (*Store, error) {
 	bs := newBlobStore(r, opts.Remote, opts.Prefix, paths)
 
 	if err := probe(bs); err != nil {
+		return nil, err
+	}
+	if err := refuseLegacyLayout(context.Background(), bs); err != nil {
 		return nil, err
 	}
 	return &Store{blobStore: bs}, nil

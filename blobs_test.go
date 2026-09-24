@@ -23,9 +23,13 @@ import (
 // body. Binary-unsafe payloads (NUL bytes) are cat'd from fixture files rather than
 // interpolated into the script.
 type blobFakeSpec struct {
-	// lsf: existence probe (Put) and recursive listing (List) both dispatch here.
-	lsfOut  string // stdout emitted for lsf (a leaf line = present; a listing for List)
-	lsfExit int    // lsf exit status (3/4 = not-found → absent/empty)
+	// lsf WITHOUT -R: the startup probe (New) and Put's existence probe.
+	lsfOut  string // stdout emitted for a non-recursive lsf (the exact leaf line = present)
+	lsfExit int    // non-recursive lsf exit status (3/4 = not-found → absent)
+
+	// lsf WITH -R: the recursive listing behind List and New's legacy-layout scan.
+	lsROut  string // stdout emitted for a recursive lsf (one store-relative path per line)
+	lsRExit int    // recursive lsf exit status (3/4 = not-found → empty)
 
 	// cat: existing-object read (Put present branch) and Get.
 	catOut  []byte // stdout bytes emitted for cat (binary-safe)
@@ -52,10 +56,16 @@ func writeBlobFake(t *testing.T, dir string, spec blobFakeSpec) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString("sub=\"$1\"\n")
-	b.WriteString("printf '%s\\n' \"$@\" > " + q(dir) + "/\"argv.$sub\"\n")
+	b.WriteString("[ \"$sub\" = lsf ] || printf '%s\\n' \"$@\" > " + q(dir) + "/\"argv.$sub\"\n")
 	b.WriteString("case \"$sub\" in\n")
 
 	b.WriteString("lsf)\n")
+	b.WriteString("for a in \"$@\"; do if [ \"$a\" = -R ]; then\n")
+	b.WriteString("printf '%s\\n' \"$@\" > " + q(dir) + "/argv.lsfR\n")
+	b.WriteString("printf '%s' " + q(spec.lsROut) + "\n")
+	b.WriteString("exit " + strconv.Itoa(spec.lsRExit) + "\n")
+	b.WriteString("fi; done\n")
+	b.WriteString("printf '%s\\n' \"$@\" > " + q(dir) + "/argv.lsf\n")
 	b.WriteString("printf '%s' " + q(spec.lsfOut) + "\n")
 	b.WriteString("exit " + strconv.Itoa(spec.lsfExit) + "\n;;\n")
 
@@ -156,27 +166,27 @@ func TestObjectPathForms(t *testing.T) {
 	}{
 		{
 			name: "named remote with prefix", remote: "myremote", prefix: "pfx", key: "blobs/abc",
-			wantObj: "myremote:pfx/blobs/abc", wantRoot: "myremote:pfx",
+			wantObj: "myremote:pfx/blobs/abc@blob", wantRoot: "myremote:pfx",
 		},
 		{
 			name: "named remote empty prefix collapses (no spurious slash)", remote: "myremote", prefix: "", key: "blobs/abc",
-			wantObj: "myremote:blobs/abc", wantRoot: "myremote:",
+			wantObj: "myremote:blobs/abc@blob", wantRoot: "myremote:",
 		},
 		{
 			name: "connection string with path and prefix", remote: ":local:/tmp/x", prefix: "pfx", key: "blobs/abc",
-			wantObj: ":local:/tmp/x/pfx/blobs/abc", wantRoot: ":local:/tmp/x/pfx",
+			wantObj: ":local:/tmp/x/pfx/blobs/abc@blob", wantRoot: ":local:/tmp/x/pfx",
 		},
 		{
 			name: "connection string empty prefix appends with slash", remote: ":local:/tmp/x", prefix: "", key: "blobs/abc",
-			wantObj: ":local:/tmp/x/blobs/abc", wantRoot: ":local:/tmp/x",
+			wantObj: ":local:/tmp/x/blobs/abc@blob", wantRoot: ":local:/tmp/x",
 		},
 		{
 			name: "bare backend connection string empty prefix", remote: ":local:", prefix: "", key: "blobs/abc",
-			wantObj: ":local:/blobs/abc", wantRoot: ":local:",
+			wantObj: ":local:/blobs/abc@blob", wantRoot: ":local:",
 		},
 		{
 			name: "s3-style connection string with params", remote: ":s3,provider=Minio:", prefix: "snaps", key: "x/y",
-			wantObj: ":s3,provider=Minio:/snaps/x/y", wantRoot: ":s3,provider=Minio:/snaps",
+			wantObj: ":s3,provider=Minio:/snaps/x/y@blob", wantRoot: ":s3,provider=Minio:/snaps",
 		},
 	}
 	for _, tt := range tests {
@@ -204,7 +214,7 @@ func TestBlobsConnStringPositional(t *testing.T) {
 		remote  = ":local:/tmp/root"
 		prefix  = "pfx"
 		key     = "blobs/k"
-		wantObj = ":local:/tmp/root/pfx/blobs/k"
+		wantObj = ":local:/tmp/root/pfx/blobs/k@blob"
 		wantRt  = ":local:/tmp/root/pfx"
 	)
 
@@ -252,10 +262,10 @@ func TestBlobsConnStringPositional(t *testing.T) {
 
 	t.Run("List root", func(t *testing.T) {
 		t.Parallel()
-		b, dir := newTestBlobStoreWith(t, blobFakeSpec{lsfOut: "blobs/a\n"}, remote, prefix)
+		b, dir := newTestBlobStoreWith(t, blobFakeSpec{lsROut: "blobs/a@blob\n"}, remote, prefix)
 		_, err := b.List(context.Background(), "")
 		requireNoErr(t, err)
-		argv, ok := argvOf(t, dir, "lsf")
+		argv, ok := argvOf(t, dir, "lsfR")
 		if !ok {
 			t.Fatalf("lsf not invoked")
 		}
@@ -266,7 +276,7 @@ func TestBlobsConnStringPositional(t *testing.T) {
 func TestBlobsPut(t *testing.T) {
 	t.Parallel()
 	const key = "blobs/abc123"
-	const wantPath = "remote:pfx/blobs/abc123"
+	const wantPath = "remote:pfx/blobs/abc123@blob"
 	content := []byte("content-addressed bytes \x00\xff end")
 
 	tests := []struct {
@@ -277,6 +287,7 @@ func TestBlobsPut(t *testing.T) {
 		wantRcat   bool   // rcat must have been invoked
 		wantStdin  []byte // expected captured rcat stdin (when wantRcat)
 		wantNoRcat bool   // rcat must NOT have been invoked
+		wantNoCat  bool   // cat must NOT have been invoked (the existing object was never read)
 	}{
 		{
 			name:      "absent streams via rcat",
@@ -285,6 +296,7 @@ func TestBlobsPut(t *testing.T) {
 			wantErr:   func(t *testing.T, err error) { requireNoErr(t, err) },
 			wantRcat:  true,
 			wantStdin: content,
+			wantNoCat: true,
 		},
 		{
 			name:      "absent via empty lsf output still streams",
@@ -296,24 +308,55 @@ func TestBlobsPut(t *testing.T) {
 		},
 		{
 			name:       "present identical is a no-op success",
-			spec:       blobFakeSpec{lsfOut: "abc123\n", catOut: content},
+			spec:       blobFakeSpec{lsfOut: "abc123@blob\n", catOut: content},
 			body:       content,
 			wantErr:    func(t *testing.T, err error) { requireNoErr(t, err) },
 			wantNoRcat: true,
 		},
 		{
 			name:       "present different conflicts and does not upload",
-			spec:       blobFakeSpec{lsfOut: "abc123\n", catOut: []byte("original bytes")},
+			spec:       blobFakeSpec{lsfOut: "abc123@blob\n", catOut: []byte("original bytes")},
 			body:       []byte("different bytes"),
 			wantErr:    func(t *testing.T, err error) { requireBlobConflict(t, err, key) },
 			wantNoRcat: true,
 		},
 		{
 			name:       "present empty-vs-nonempty conflicts",
-			spec:       blobFakeSpec{lsfOut: "abc123\n", catOut: []byte("original")},
+			spec:       blobFakeSpec{lsfOut: "abc123@blob\n", catOut: []byte("original")},
 			body:       []byte{},
 			wantErr:    func(t *testing.T, err error) { requireBlobConflict(t, err, key) },
 			wantNoRcat: true,
+		},
+		{
+			// A directory sits at the blob's own location (foreign data, or any
+			// remote that lists a prefix as a directory): lsf lists its CHILDREN.
+			// That is not the blob, so Put must treat the key as absent and let
+			// rcat decide — never cat the directory and report a false conflict.
+			name:      "directory at the leaf location is absent, never a conflict",
+			spec:      blobFakeSpec{lsfOut: "b@blob\nabc123@blob.partial\n", catOut: []byte("dir contents")},
+			body:      content,
+			wantErr:   func(t *testing.T, err error) { requireNoErr(t, err) },
+			wantRcat:  true,
+			wantStdin: content,
+			wantNoCat: true,
+		},
+		{
+			name:      "directory containing only a same-named child among others is absent",
+			spec:      blobFakeSpec{lsfOut: "abc123@blob\nother@blob\n", catOut: []byte("dir contents")},
+			body:      content,
+			wantErr:   func(t *testing.T, err error) { requireNoErr(t, err) },
+			wantRcat:  true,
+			wantStdin: content,
+			wantNoCat: true,
+		},
+		{
+			name:      "a legacy unsuffixed leaf name is not the encoded blob",
+			spec:      blobFakeSpec{lsfOut: "abc123\n", catOut: []byte("legacy bytes")},
+			body:      content,
+			wantErr:   func(t *testing.T, err error) { requireNoErr(t, err) },
+			wantRcat:  true,
+			wantStdin: content,
+			wantNoCat: true,
 		},
 		{
 			name:    "lsf probe hard-error propagates (not swallowed as absent)",
@@ -327,7 +370,7 @@ func TestBlobsPut(t *testing.T) {
 			name: "present cat hard-error propagates (not swallowed)",
 			// Present per lsf, but reading the existing object hard-fails (exit 5).
 			// The present branch must propagate it, never re-interpret it or upload.
-			spec:       blobFakeSpec{lsfOut: "abc123\n", catExit: 5, catErr: "connection refused\n"},
+			spec:       blobFakeSpec{lsfOut: "abc123@blob\n", catExit: 5, catErr: "connection refused\n"},
 			body:       content,
 			wantErr:    func(t *testing.T, err error) { requireRcloneExit(t, err, 5) },
 			wantNoRcat: true,
@@ -350,6 +393,9 @@ func TestBlobsPut(t *testing.T) {
 			}
 			assertDashDashBeforePositional(t, lsfArgv, wantPath)
 
+			if _, catRan := argvOf(t, dir, "cat"); tt.wantNoCat && catRan {
+				t.Fatalf("cat was invoked but must not have been")
+			}
 			rcatArgv, rcatRan := argvOf(t, dir, "rcat")
 			switch {
 			case tt.wantRcat:
@@ -376,13 +422,14 @@ func TestBlobsPut(t *testing.T) {
 func TestBlobsGet(t *testing.T) {
 	t.Parallel()
 	const key = "blobs/get"
-	const wantPath = "remote:pfx/blobs/get"
+	const wantPath = "remote:pfx/blobs/get@blob"
 
 	tests := []struct {
-		name    string
-		spec    blobFakeSpec
-		want    []byte
-		wantErr func(t *testing.T, err error)
+		name        string
+		spec        blobFakeSpec
+		want        []byte
+		wantErr     func(t *testing.T, err error)
+		wantConfirm bool // the exact-leaf lsf probe must run (only after empty cat output)
 	}{
 		{
 			name: "present streams bytes",
@@ -390,9 +437,37 @@ func TestBlobsGet(t *testing.T) {
 			want: []byte("streamed \x00\xff bytes"),
 		},
 		{
-			name: "present empty object",
-			spec: blobFakeSpec{catOut: []byte{}},
-			want: []byte{},
+			// Empty output is ambiguous on an object store (rclone cats an absent
+			// key as an empty "directory", exit 0), so it is confirmed with the
+			// exact-leaf probe: here the object exists and is genuinely empty.
+			name:        "present empty object (confirmed by the leaf probe)",
+			spec:        blobFakeSpec{catOut: []byte{}, lsfOut: "get@blob\n"},
+			want:        []byte{},
+			wantConfirm: true,
+		},
+		{
+			name:        "empty output of an absent object-store key maps to BlobNotFoundError",
+			spec:        blobFakeSpec{catOut: []byte{}, lsfOut: ""},
+			wantErr:     func(t *testing.T, err error) { requireBlobNotFound(t, err, key) },
+			wantConfirm: true,
+		},
+		{
+			name:        "empty output where the leaf probe finds only a directory is BlobNotFoundError",
+			spec:        blobFakeSpec{catOut: []byte{}, lsfOut: "child@blob\n"},
+			wantErr:     func(t *testing.T, err error) { requireBlobNotFound(t, err, key) },
+			wantConfirm: true,
+		},
+		{
+			name:        "empty output with a not-found leaf probe is BlobNotFoundError",
+			spec:        blobFakeSpec{catOut: []byte{}, lsfExit: exitDirNotFound},
+			wantErr:     func(t *testing.T, err error) { requireBlobNotFound(t, err, key) },
+			wantConfirm: true,
+		},
+		{
+			name:        "empty output with a failing leaf probe propagates, never not-found",
+			spec:        blobFakeSpec{catOut: []byte{}, lsfExit: 5},
+			wantErr:     func(t *testing.T, err error) { requireRcloneExit(t, err, 5) },
+			wantConfirm: true,
 		},
 		{
 			name:    "absent via exit 4 maps to BlobNotFoundError",
@@ -423,6 +498,13 @@ func TestBlobsGet(t *testing.T) {
 			b, dir := newTestBlobStore(t, tt.spec)
 
 			rc, err := b.Get(context.Background(), key)
+			lsfArgv, confirmed := argvOf(t, dir, "lsf")
+			if confirmed != tt.wantConfirm {
+				t.Fatalf("leaf probe ran = %v, want %v; argv=%v", confirmed, tt.wantConfirm, lsfArgv)
+			}
+			if confirmed {
+				assertDashDashBeforePositional(t, lsfArgv, wantPath)
+			}
 			if tt.wantErr != nil {
 				tt.wantErr(t, err)
 				return
@@ -450,7 +532,7 @@ func TestBlobsGet(t *testing.T) {
 func TestBlobsDelete(t *testing.T) {
 	t.Parallel()
 	const key = "blobs/del"
-	const wantPath = "remote:pfx/blobs/del"
+	const wantPath = "remote:pfx/blobs/del@blob"
 
 	tests := []struct {
 		name    string
@@ -509,46 +591,94 @@ func TestBlobsList(t *testing.T) {
 		wantErr func(t *testing.T, err error)
 	}{
 		{
-			name:   "unsorted with duplicates sorted and deduped",
-			spec:   blobFakeSpec{lsfOut: "blobs/c\nblobs/a\nsnaps/z\nblobs/b\nblobs/a\n"},
+			name:   "unsorted with duplicates decoded, sorted and deduped",
+			spec:   blobFakeSpec{lsROut: "blobs/c@blob\nblobs/a@blob\nsnaps/z@blob\nblobs/b@blob\nblobs/a@blob\n"},
 			prefix: "",
 			want:   []string{"blobs/a", "blobs/b", "blobs/c", "snaps/z"},
 		},
 		{
 			name:   "prefix filters then sorts",
-			spec:   blobFakeSpec{lsfOut: "snaps/z\nblobs/c\nblobs/a\nblobs/b\n"},
+			spec:   blobFakeSpec{lsROut: "snaps/z@blob\nblobs/c@blob\nblobs/a@blob\nblobs/b@blob\n"},
 			prefix: "blobs/",
 			want:   []string{"blobs/a", "blobs/b", "blobs/c"},
 		},
 		{
+			// The encoded order lists "a/b@blob" before "a@blob"; List must sort the
+			// DECODED keys, and a key coexists with its '/' extension and a sibling
+			// that merely shares a string prefix.
+			name:   "a key, its extension and a string-prefix sibling all list",
+			spec:   blobFakeSpec{lsROut: "sessions/a/b@blob\nsessions/ab@blob\nsessions/a@blob\nsessions/a/b/c@blob\n"},
+			prefix: "sessions/a",
+			want:   []string{"sessions/a", "sessions/a/b", "sessions/a/b/c", "sessions/ab"},
+		},
+		{
+			name:   "prefix is applied to the decoded key, not the encoded path",
+			spec:   blobFakeSpec{lsROut: "sessions/a@blob\nsessions/a/b@blob\n"},
+			prefix: "sessions/a@",
+			want:   nil,
+		},
+		{
+			name:   "prefix spelled with the whole suffix matches nothing",
+			spec:   blobFakeSpec{lsROut: "sessions/a@blob\n"},
+			prefix: "sessions/a@blob",
+			want:   nil,
+		},
+		{
+			name:   "prefix ending in a separator returns only descendants",
+			spec:   blobFakeSpec{lsROut: "sessions/a@blob\nsessions/a/b@blob\n"},
+			prefix: "sessions/a/",
+			want:   []string{"sessions/a/b"},
+		},
+		{
 			name:   "prefix matching nothing is empty",
-			spec:   blobFakeSpec{lsfOut: "blobs/a\nblobs/b\n"},
+			spec:   blobFakeSpec{lsROut: "blobs/a@blob\nblobs/b@blob\n"},
 			prefix: "snaps/",
 			want:   nil,
 		},
 		{
 			name:   "blank lines and CR are ignored",
-			spec:   blobFakeSpec{lsfOut: "blobs/a\r\n\nblobs/b\r\n"},
+			spec:   blobFakeSpec{lsROut: "blobs/a@blob\r\n\nblobs/b@blob\r\n"},
 			prefix: "",
 			want:   []string{"blobs/a", "blobs/b"},
 		},
 		{
+			// Entries this layout never writes and a legacy store never wrote are
+			// not keys and not legacy: skipped. rclone's in-flight ".partial" upload
+			// of a suffixed leaf, a bare suffix, a doubled suffix, a directory
+			// carrying the suffix, uppercase and dotfile names.
+			name: "foreign entries are skipped",
+			spec: blobFakeSpec{lsROut: "blobs/a@blob\nblobs/b@blob.1a2b3c4d.partial\n@blob\nblobs/@blob\n" +
+				"blobs/c@blob@blob\nblobs/d@blob/e@blob\nblobs/Upper@blob\nREADME\nblobs/.hidden@blob\n.DS_Store\nblobs/f@kv\n"},
+			prefix: "",
+			want:   []string{"blobs/a"},
+		},
+		{
 			name:   "empty store via not-found root is empty",
-			spec:   blobFakeSpec{lsfExit: exitDirNotFound, lsfOut: ""},
+			spec:   blobFakeSpec{lsRExit: exitDirNotFound, lsROut: ""},
 			prefix: "",
 			want:   nil,
 		},
 		{
 			name:   "empty store via empty output is empty",
-			spec:   blobFakeSpec{lsfExit: 0, lsfOut: ""},
+			spec:   blobFakeSpec{lsRExit: 0, lsROut: ""},
 			prefix: "",
 			want:   nil,
 		},
 		{
 			name:    "genuine listing error propagates",
-			spec:    blobFakeSpec{lsfExit: 5, lsfOut: ""},
+			spec:    blobFakeSpec{lsRExit: 5, lsROut: ""},
 			prefix:  "",
 			wantErr: func(t *testing.T, err error) { requireRcloneExit(t, err, 5) },
+		},
+		{
+			// A v0.4.x-shaped object (its path IS a valid storage name) written
+			// after New — e.g. by a rolled-back binary — fails the listing closed
+			// rather than disappearing from it. The lexically first one is named,
+			// and the prefix does not hide it.
+			name:    "legacy unsuffixed object fails closed",
+			spec:    blobFakeSpec{lsROut: "blobs/a@blob\nsnaps/z\nblobs/legacy\n"},
+			prefix:  "blobs/",
+			wantErr: func(t *testing.T, err error) { requireLegacyLayout(t, err, "blobs/legacy") },
 		},
 	}
 
@@ -568,19 +698,109 @@ func TestBlobsList(t *testing.T) {
 				t.Fatalf("List(%q) = %v, want %v", tt.prefix, got, tt.want)
 			}
 
-			lsfArgv, ok := argvOf(t, dir, "lsf")
+			lsfArgv, ok := argvOf(t, dir, "lsfR")
 			if !ok {
-				t.Fatalf("lsf was not invoked")
+				t.Fatalf("recursive lsf was not invoked")
 			}
 			assertDashDashBeforePositional(t, lsfArgv, wantRoot)
-			if !containsStr(lsfArgv, "-R") {
-				t.Fatalf("List lsf missing -R; argv=%v", lsfArgv)
-			}
 			if !containsStr(lsfArgv, "--files-only") {
 				t.Fatalf("List lsf missing --files-only; argv=%v", lsfArgv)
 			}
 		})
 	}
+}
+
+// TestLeafEncoding pins the '@blob' leaf encoding: every valid storage name maps
+// to "<name>@blob" and decodes back exactly, and only such paths decode. A
+// directory component is always a valid segment and so never contains '@'; a leaf
+// file's name always ends in "@blob" and so is never a valid segment — which is
+// what lets "k" and "k/…" coexist and what makes a legacy object detectable.
+func TestLeafEncoding(t *testing.T) {
+	t.Parallel()
+
+	roundTrip := []string{
+		"a", "a/b", "sessions/a/b/c", "a.blob", "a.blob/b", "ablob", "x_y-z.0", "0",
+		"sessions/00000000-0000-0000-0000-000000000000/blobs/v1/tool-result/abcdef/1",
+	}
+	for _, key := range roundTrip {
+		key := key
+		t.Run("round trip "+key, func(t *testing.T) {
+			t.Parallel()
+			enc := encodeLeaf(key)
+			if enc != key+"@blob" {
+				t.Fatalf("encodeLeaf(%q) = %q, want %q", key, enc, key+"@blob")
+			}
+			got, ok := decodeLeaf(enc)
+			if !ok || got != key {
+				t.Fatalf("decodeLeaf(%q) = %q, %v; want %q, true", enc, got, ok, key)
+			}
+			if isLegacyLeaf(enc) {
+				t.Fatalf("isLegacyLeaf(%q) = true for a current-layout leaf", enc)
+			}
+			if !isLegacyLeaf(key) {
+				t.Fatalf("isLegacyLeaf(%q) = false for the v0.4.x path of the same key", key)
+			}
+		})
+	}
+
+	notLeaves := []string{
+		"", "a", "a/b", "@blob", "a/@blob", "a@blob@blob", "a@blob/b@blob", "A@blob", "a@blob.1a2b.partial",
+		".tmp@blob", "a@BLOB", "a@blo", "a@kv", "a/b@blob/", "/a@blob", "a//b@blob", "../a@blob",
+	}
+	for _, rel := range notLeaves {
+		rel := rel
+		t.Run("not a leaf "+strconv.Quote(rel), func(t *testing.T) {
+			t.Parallel()
+			if got, ok := decodeLeaf(rel); ok {
+				t.Fatalf("decodeLeaf(%q) = %q, true; want not a leaf", rel, got)
+			}
+		})
+	}
+
+	notLegacy := []string{"", "a@blob", "a@blob.1a2b.partial", "README", ".DS_Store", "a/.x", "a/B", "a//b"}
+	for _, rel := range notLegacy {
+		rel := rel
+		t.Run("not legacy "+strconv.Quote(rel), func(t *testing.T) {
+			t.Parallel()
+			if isLegacyLeaf(rel) {
+				t.Fatalf("isLegacyLeaf(%q) = true; want false", rel)
+			}
+		})
+	}
+}
+
+// FuzzLeafEncoding: for every valid name, encode→decode is the identity, the
+// encoded path is never legacy-shaped, and no directory component of the encoded
+// path can itself be a leaf (so a leaf and a directory never share an entry).
+func FuzzLeafEncoding(f *testing.F) {
+	for _, seed := range []string{"a", "a/b", "sessions/a/b/c", "a.blob/b", "x@blob", "A", ""} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, key string) {
+		if storage.ValidateName(key) != nil {
+			if isLegacyLeaf(key) {
+				t.Fatalf("isLegacyLeaf(%q) = true for an invalid name", key)
+			}
+			return
+		}
+		enc := encodeLeaf(key)
+		got, ok := decodeLeaf(enc)
+		if !ok || got != key {
+			t.Fatalf("decodeLeaf(encodeLeaf(%q)) = %q, %v", key, got, ok)
+		}
+		if isLegacyLeaf(enc) {
+			t.Fatalf("encoded leaf %q is legacy-shaped", enc)
+		}
+		segs := strings.Split(enc, "/")
+		for _, dirSeg := range segs[:len(segs)-1] {
+			if strings.Contains(dirSeg, "@") {
+				t.Fatalf("directory component %q of %q contains '@'", dirSeg, enc)
+			}
+		}
+		if !strings.HasSuffix(segs[len(segs)-1], "@blob") {
+			t.Fatalf("leaf %q of %q lacks the suffix", segs[len(segs)-1], enc)
+		}
+	})
 }
 
 // TestBlobsInvalidKeyNeverExecs asserts that every write/read method validates the
@@ -633,7 +853,7 @@ func TestBlobsInvalidKeyNeverExecs(t *testing.T) {
 				if ine.Name != bad.value {
 					t.Fatalf("InvalidNameError.Name = %q, want %q", ine.Name, bad.value)
 				}
-				for _, sub := range []string{"lsf", "cat", "rcat", "deletefile"} {
+				for _, sub := range []string{"lsf", "lsfR", "cat", "rcat", "deletefile"} {
 					if _, ran := argvOf(t, dir, sub); ran {
 						t.Fatalf("%s(%q) invoked rclone %s before validation", m.name, bad.value, sub)
 					}
@@ -647,7 +867,7 @@ func TestBlobsInvalidKeyNeverExecs(t *testing.T) {
 // a grammar-violating prefix is a legal filter, not an error.
 func TestBlobsListPrefixNotValidated(t *testing.T) {
 	t.Parallel()
-	b, _ := newTestBlobStore(t, blobFakeSpec{lsfOut: "blobs/a\nblobs/b\n"})
+	b, _ := newTestBlobStore(t, blobFakeSpec{lsROut: "blobs/a@blob\nblobs/b@blob\n"})
 	got, err := b.List(context.Background(), "Bad//Prefix..")
 	if err != nil {
 		t.Fatalf("List(invalid-looking prefix) = %v, want nil error", err)
@@ -661,7 +881,7 @@ func TestBlobsPutSourceError(t *testing.T) {
 	t.Parallel()
 	// Present object (lsf says present, cat returns bytes) so Put takes the
 	// buffering branch and reads the caller's reader — which fails mid-stream.
-	b, _ := newTestBlobStore(t, blobFakeSpec{lsfOut: "k\n", catOut: []byte("existing")})
+	b, _ := newTestBlobStore(t, blobFakeSpec{lsfOut: "src@blob\n", catOut: []byte("existing")})
 
 	const key = "blobs/src"
 	err := b.Put(context.Background(), key, &failingReader{})
@@ -700,6 +920,20 @@ func requireBlobConflict(t *testing.T, err error, key string) {
 	}
 	if bc.Key != key {
 		t.Fatalf("BlobConflictError.Key = %q, want %q", bc.Key, key)
+	}
+}
+
+func requireLegacyLayout(t *testing.T, err error, path string) {
+	t.Helper()
+	var le *LegacyLayoutError
+	if !errors.As(err, &le) {
+		t.Fatalf("error = %T %v, want *LegacyLayoutError", err, err)
+	}
+	if le.Path != path {
+		t.Fatalf("LegacyLayoutError.Path = %q, want %q", le.Path, path)
+	}
+	if !errors.Is(err, ErrLegacyLayout) {
+		t.Fatalf("LegacyLayoutError does not match ErrLegacyLayout: %v", err)
 	}
 }
 

@@ -20,7 +20,7 @@ s, err := rclonestore.New(rclonestore.Options{
 	Timeout:          30 * time.Second, // optional per-call bound
 })
 if err != nil {
-    return err // *OptionsError | *BinaryError | *ProbeError
+    return err // *OptionsError | *BinaryError | *ProbeError | *LegacyLayoutError | *LayoutScanError
 }
 // s is a storage.Blobs: Put / Get / Delete / List.
 ```
@@ -77,13 +77,49 @@ sorted, and deduplicated. A directory that does not exist yet is supported; a br
 or path that resolves to a regular file returns `*PersistencePathError`. Both the option slice
 and every returned slice are defensively copied.
 
+### Object layout (v0.5.0) — BREAKING, no migration
+
+Each key is stored at `<prefix>/<key>@blob`: key `sessions/a` is the object `sessions/a@blob`,
+key `sessions/a/b` is `sessions/a/b@blob`. Storage names allow only `[a-z0-9][a-z0-9_.-]*` per
+segment, so `@` never appears in a directory component and always appears in a leaf. A key and
+a key extending it with `/…` therefore never contend for one location, on filesystem-shaped
+remotes (`:local:`, SFTP, …) as well as bucket-based ones — the storage v0.7.0 rule that they are
+distinct names, both storable whichever is written first. `List` decodes the leaves back to keys
+and skips anything that is not an `@blob` leaf (rclone `.partial` uploads, dotfiles, uppercase
+names). The suffix counts against a filesystem's 255-byte file-name limit, so a key's final
+segment may be at most 250 bytes on such a remote.
+
+rclonestore ≤ v0.4.x stored a key at its bare path. **That layout is not migrated and not
+read.** `New` refuses a store root holding any object whose whole root-relative path is a valid
+storage name (which is exactly what ≤ v0.4.x wrote, and never what v0.5.0 writes) with
+`*LegacyLayoutError` (`errors.Is(err, ErrLegacyLayout)`; `Path` names the lexically first such
+object). `List` fails closed the same way if one appears later, e.g. from a rolled-back binary,
+instead of silently omitting it. Move or delete the old root. The root must be dedicated to
+rclonestore: a foreign object spelled like a storage name is indistinguishable from legacy data
+and is refused too. **One-way:** ≤ v0.4.x does not understand a v0.5.0 root (its `Get` finds
+nothing and its `List` reports `…@blob` names), so never roll a root back.
+
+The scan is one recursive listing of the root at every `New` — the same cost as one `List` call,
+which on a large bucket is many list requests. A scan failure is `*LayoutScanError` (wrapping
+the `*RcloneError`), never read as clean or as legacy.
+
 ### Startup probe
 
 `New` probes reachability with `rclone lsf --max-depth 0 -- <remote-root>`, bounded by
 `Timeout`. A benign not-found on the root (a fresh store whose root directory does not exist
 yet — first `Put` creates it) is treated as reachable-but-empty and succeeds, matching
 `List`'s semantics. Any other failure (unknown remote, auth, network) is a `*ProbeError`
-wrapping the credential-safe `*RcloneError`.
+wrapping the credential-safe `*RcloneError`. The legacy-layout scan described above runs only
+after the probe succeeds.
+
+### Existence and empty objects
+
+`Put` probes for an existing object with `rclone lsf --files-only -- <object>` and treats it as
+present only when rclone prints exactly that object's leaf name. A directory at the object's
+location lists its children instead, so it is never taken for the blob and never reported as a
+`*BlobConflictError`; `rcat` then fails with the backend's own error on a filesystem remote.
+A bucket-based remote cats an absent key as nothing with exit 0, so `Get` confirms an empty
+result with the same probe and reports `*BlobNotFoundError` unless the object exists.
 
 ## Security posture
 
@@ -108,6 +144,9 @@ All errors are typed; classify with `errors.As`.
   not be canonicalized (wraps an underlying filesystem cause when applicable).
 - `*BinaryError` — the rclone binary could not be resolved on PATH (wraps the `exec.LookPath` cause).
 - `*ProbeError` — the startup reachability probe failed (wraps the underlying `*RcloneError`).
+- `*LegacyLayoutError` — the store root holds rclonestore ≤ v0.4.x (bare-path) objects; matches
+  `ErrLegacyLayout`. Returned by `New`, and by `List` if such an object appears later.
+- `*LayoutScanError` — `New`'s legacy-layout scan could not list the root (wraps the `*RcloneError`).
 - `*RcloneError` — a failed rclone invocation (non-zero exit, start failure, or ctx kill).
 - `*PutSourceError` — reading the caller's `Put` reader failed.
 - storage's `*BlobNotFoundError`, `*BlobConflictError`, `*InvalidNameError` per the Blobs contract.
@@ -117,6 +156,8 @@ All errors are typed; classify with `errors.As`.
 ```sh
 GOWORK=off make check                          # gofmt + vet + gosec + race unit tests
 GOWORK=off go test -tags integration -race ./... # storage Blobs conformance vs. real rclone
+RCLONESTORE_CONFORMANCE_REMOTE=':s3,provider=Other,endpoint=…:bucket' \
+  GOWORK=off go test -tags integration -race -run ConformanceRemote ./... # …and vs. another remote
 ```
 
 The unit tests drive a generated fake `rclone` (per-test `#!/bin/sh` script) and never touch
@@ -125,7 +166,10 @@ the network. The **conformance** suite (`//go:build integration`) runs storage's
 (`:local:<temp dir>`) — no cloud credentials — and **skips** (never fails) when `rclone` is
 not on PATH. It is the harness that validates the not-found exit-code classification (3/4 plus
 the stderr marker), the remote-form-aware object path, and the `lsf`-on-a-file existence probe
-against real rclone.
+against real rclone, together with the storage v0.7.0 nested-key cases, the legacy-layout
+refusal and the directory-is-not-a-conflict case on a real `:local:` root. Setting
+`RCLONESTORE_CONFORMANCE_REMOTE` to any remote (for example an S3-compatible bucket) runs the same
+suite there, one fresh prefix per backend instance.
 
 Every Go command runs with **`GOWORK=off`** so the parent `go.work` at `~/code` never captures
 this module.

@@ -230,10 +230,13 @@ func TestExampleBlobRemote(t *testing.T) {
 		t.Fatalf("read subprocess log: %v", err)
 	}
 	log := string(logData)
-	if !strings.HasPrefix(log, "lsf --max-depth 0 -- docs-remote:examples\n") {
-		t.Fatalf("first subprocess was not the exact startup probe:\n%s", log)
+	// New probes reachability, then scans the root once for objects written by
+	// rclonestore <= v0.4.x (refused with ErrLegacyLayout; there is no migration).
+	if !strings.HasPrefix(log, "lsf --max-depth 0 -- docs-remote:examples\nlsf --files-only -R -- docs-remote:examples\n") {
+		t.Fatalf("New did not run the exact startup probe then legacy-layout scan:\n%s", log)
 	}
-	if got := strings.Count(log, "rcat -- docs-remote:examples/"+alphaKey+"\n"); got != 1 {
+	// Each key is stored at "<key>@blob", so a key and its "/…" extension coexist.
+	if got := strings.Count(log, "rcat -- docs-remote:examples/"+alphaKey+"@blob\n"); got != 1 {
 		t.Fatalf("alpha rcat count = %d, want 1 (identical/conflicting Put must not upload)\n%s", got, log)
 	}
 	liveEntries, err := os.ReadDir(liveDir)

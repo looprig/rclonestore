@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -532,5 +533,141 @@ func TestLookPathResolvesAbsoluteFake(t *testing.T) {
 	}
 	if resolved != bin {
 		t.Errorf("LookPath = %q, want %q", resolved, bin)
+	}
+}
+
+// TestNewLegacyLayout pins New's fail-closed refusal of a store root written by
+// rclonestore <= v0.4.x, whose objects sit at their bare key path. Such a path is
+// itself a valid storage name, and no path this layout writes ever is (every leaf
+// ends in "@blob"), so the rule is exact for rclonestore's own output. The scan is
+// one recursive listing of the store root, run after the reachability probe.
+func TestNewLegacyLayout(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		spec       blobFakeSpec
+		wantLegacy string // lexically first legacy path; "" = New succeeds
+		wantScan   int    // exit code wrapped by *LayoutScanError; 0 = none
+		wantNoScan bool   // the scan must not have run (probe failed first)
+		wantProbe  bool   // expect *ProbeError
+	}{
+		{name: "fresh empty root opens", spec: blobFakeSpec{}},
+		{name: "absent root (exit 3) opens", spec: blobFakeSpec{lsRExit: exitDirNotFound}},
+		{name: "absent root (exit 4) opens", spec: blobFakeSpec{lsRExit: exitFileNotFound}},
+		{
+			name: "current-layout data and foreign entries open",
+			spec: blobFakeSpec{lsROut: "sessions/a@blob\nsessions/a/b@blob\nsessions/a@blob.1a2b.partial\n" +
+				".DS_Store\nREADME\nsessions/Upper\nsessions/.tmp\n"},
+		},
+		{name: "a legacy object is refused", spec: blobFakeSpec{lsROut: "sessions/a\n"}, wantLegacy: "sessions/a"},
+		{name: "a legacy top-level object is refused", spec: blobFakeSpec{lsROut: "k\n"}, wantLegacy: "k"},
+		{
+			name:       "a legacy object beside current data is refused",
+			spec:       blobFakeSpec{lsROut: "sessions/a@blob\nsessions/b/c\nsessions/z@blob\n"},
+			wantLegacy: "sessions/b/c",
+		},
+		{
+			name:       "the lexically first legacy object is named",
+			spec:       blobFakeSpec{lsROut: "zz/y\nsessions/a/b\naa\nsessions/a\n"},
+			wantLegacy: "aa",
+		},
+		{
+			name:       "a legacy dotted name is refused",
+			spec:       blobFakeSpec{lsROut: "sessions/a.blob\n"},
+			wantLegacy: "sessions/a.blob",
+		},
+		{
+			name:       "a crashed legacy upload's partial file is refused",
+			spec:       blobFakeSpec{lsROut: "sessions/a.1a2b3c4d.partial\n"},
+			wantLegacy: "sessions/a.1a2b3c4d.partial",
+		},
+		{name: "a scan failure is typed, never clean or legacy", spec: blobFakeSpec{lsRExit: 5, lsROut: "sessions/a\n"}, wantScan: 5},
+		{name: "a failed probe skips the scan", spec: blobFakeSpec{lsfExit: 5, lsROut: "sessions/a\n"}, wantProbe: true, wantNoScan: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			bin := writeBlobFake(t, dir, tt.spec)
+			root := filepath.Join(t.TempDir(), "SECRETROOT")
+			remote := ":local:" + root
+
+			s, err := New(Options{Remote: remote, Prefix: "pfx", Binary: bin})
+
+			scanArgv, scanned := argvOf(t, dir, "lsfR")
+			if tt.wantNoScan && scanned {
+				t.Fatalf("legacy scan ran after a failed probe; argv=%v", scanArgv)
+			}
+			if !tt.wantNoScan {
+				if !scanned {
+					t.Fatalf("New did not run the legacy-layout scan")
+				}
+				assertDashDashBeforePositional(t, scanArgv, remote+"/pfx")
+				if !containsStr(scanArgv, "-R") || !containsStr(scanArgv, "--files-only") {
+					t.Fatalf("legacy scan is not a recursive files-only listing; argv=%v", scanArgv)
+				}
+			}
+			if err != nil && strings.Contains(err.Error(), "SECRETROOT") {
+				t.Fatalf("New error leaks the remote: %q", err.Error())
+			}
+
+			switch {
+			case tt.wantProbe:
+				var pe *ProbeError
+				if !errors.As(err, &pe) {
+					t.Fatalf("New = %v, want *ProbeError", err)
+				}
+			case tt.wantLegacy != "":
+				if s != nil {
+					t.Fatalf("New returned a Store for a legacy root")
+				}
+				requireLegacyLayout(t, err, tt.wantLegacy)
+				var se *LayoutScanError
+				if errors.As(err, &se) {
+					t.Fatalf("legacy refusal is also a *LayoutScanError: %v", err)
+				}
+				if msg := err.Error(); !strings.Contains(msg, strconv.Quote(tt.wantLegacy)) {
+					t.Fatalf("LegacyLayoutError message %q does not name the path", msg)
+				}
+			case tt.wantScan != 0:
+				if s != nil {
+					t.Fatalf("New returned a Store after a failed scan")
+				}
+				var se *LayoutScanError
+				if !errors.As(err, &se) {
+					t.Fatalf("New = %T %v, want *LayoutScanError", err, err)
+				}
+				if errors.Is(err, ErrLegacyLayout) {
+					t.Fatalf("a scan failure reads as legacy: %v", err)
+				}
+				var pe *ProbeError
+				if errors.As(err, &pe) {
+					t.Fatalf("a scan failure reads as a probe failure: %v", err)
+				}
+				requireRcloneExit(t, err, tt.wantScan)
+			default:
+				if err != nil {
+					t.Fatalf("New = %v, want success", err)
+				}
+			}
+		})
+	}
+}
+
+// TestLegacyLayoutErrorText pins the sentinel and the rendered message: it names
+// the store-relative path (a validated storage name) and nothing else.
+func TestLegacyLayoutErrorText(t *testing.T) {
+	t.Parallel()
+	err := error(&LegacyLayoutError{Path: "sessions/a"})
+	if !errors.Is(err, ErrLegacyLayout) {
+		t.Fatalf("LegacyLayoutError does not unwrap to ErrLegacyLayout")
+	}
+	const want = `rclonestore: store root holds pre-v0.5.0 blob "sessions/a" (unsuffixed layout; no migration — move or delete the store root)`
+	if got := err.Error(); got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+	if got := ErrLegacyLayout.Error(); got != "rclonestore: store root holds pre-v0.5.0 data" {
+		t.Fatalf("ErrLegacyLayout = %q", got)
 	}
 }

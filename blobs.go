@@ -28,6 +28,48 @@ const (
 // wording that varies by rclone version and backend.
 const notFoundMarker = "not found"
 
+// blobLeafSuffix is appended to every key to form its object's leaf name. The
+// storage grammar allows only [a-z0-9][a-z0-9_.-]* per segment, so '@' never
+// appears in a directory component (always a valid segment) and always appears in
+// a leaf name (never a valid segment): a key "k" (object "k@blob") and a key
+// "k/x" (object "k/x@blob", under directory "k") can never contend for one
+// location on a filesystem-shaped remote, whichever is written first — the
+// storage v0.7.0 rule that a key and its "/…" extension are distinct names.
+// Stripping exactly one trailing suffix is the exact inverse, so the encoding is
+// injective. A dotted suffix (".blob") would not be: key "a" would own file
+// "a.blob" while key "a.blob/b" needs a directory "a.blob". '@' is outside every
+// rclone backend's default encoding set, and valid names are lowercase ASCII, so
+// case-insensitive remotes cannot fold two encodings together.
+//
+// rclonestore <= v0.4.x stored a key at its bare path. That layout is not
+// migrated: New refuses such a root with *LegacyLayoutError (see
+// refuseLegacyLayout), and List fails closed on a bare-path object it meets.
+const blobLeafSuffix = "@blob"
+
+// encodeLeaf maps a validated storage key to its store-relative object path.
+func encodeLeaf(key string) string { return key + blobLeafSuffix }
+
+// decodeLeaf is encodeLeaf's inverse over listing output: rel is a key's object
+// only if it ends in the suffix AND the stripped remainder is a valid storage
+// name. Anything else — rclone's ".partial" in-flight uploads, a doubled or bare
+// suffix, a directory carrying '@', uppercase or dotfile names, other tools'
+// objects — is not a key and is skipped by List.
+func decodeLeaf(rel string) (string, bool) {
+	key, ok := strings.CutSuffix(rel, blobLeafSuffix)
+	if !ok || storage.ValidateName(key) != nil {
+		return "", false
+	}
+	return key, true
+}
+
+// isLegacyLeaf reports whether a store-relative object path is one rclonestore
+// <= v0.4.x would have written: its whole path is a valid storage name (the key
+// itself). No path this layout writes is one — every leaf ends in "@blob" — so the
+// test is exact for rclonestore's own output. Foreign objects that happen to be
+// spelled as a valid name are indistinguishable from legacy ones and are refused
+// too: the store root must be dedicated to rclonestore.
+func isLegacyLeaf(rel string) bool { return storage.ValidateName(rel) == nil }
+
 // blobStore implements storage.Blobs by driving the rclone binary through a
 // runner. Each object's rclone path is built from the remote, the store prefix,
 // and the per-call validated key by remoteJoin, which is aware of both remote
@@ -85,7 +127,8 @@ func (e *PutSourceError) Error() string {
 func (e *PutSourceError) Unwrap() error { return e.cause }
 
 // Put honors storage's content-addressed conflict contract. It first probes for
-// an existing object:
+// an existing object at the key's encoded path ("<key>@blob"; see exists — a
+// directory there is never taken for the blob):
 //
 //   - ABSENT (the common content-addressed case): stream r straight to
 //     "rclone rcat" with no buffering — the blob never lands in memory.
@@ -106,7 +149,7 @@ func (b *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 	}
 	path := b.objectPath(key)
 
-	present, err := b.exists(ctx, path)
+	present, err := b.exists(ctx, path, encodeLeaf(lastSegment(key)))
 	if err != nil {
 		return err
 	}
@@ -137,7 +180,9 @@ func (b *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 // Get satisfy the contract's synchronous not-found: storetest expects Get itself —
 // not a later Read — to return *storage.BlobNotFoundError, which is only knowable
 // once rclone has exited. A missing object is classified from rclone's exit
-// code/stderr and mapped to *storage.BlobNotFoundError.
+// code/stderr and mapped to *storage.BlobNotFoundError. Empty output is confirmed
+// with the exact-leaf existence probe before it is returned as an empty blob,
+// because a bucket-based remote cats an absent key as nothing with exit 0.
 func (b *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := storage.ValidateName(key); err != nil {
 		return nil, err
@@ -150,6 +195,19 @@ func (b *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 			return nil, &storage.BlobNotFoundError{Key: key}
 		}
 		return nil, err
+	}
+	if buf.Len() == 0 {
+		// Empty output is ambiguous. On a bucket-based remote (S3 and kin) rclone
+		// resolves an absent key to an empty "directory" and cats nothing with
+		// exit 0, so an absent blob would read as an empty one. Confirm with the
+		// exact-leaf probe; only a present object is an empty blob.
+		present, err := b.exists(ctx, path, encodeLeaf(lastSegment(key)))
+		if err != nil {
+			return nil, err
+		}
+		if !present {
+			return nil, &storage.BlobNotFoundError{Key: key}
+		}
 	}
 	return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
 }
@@ -175,25 +233,33 @@ func (b *blobStore) Delete(ctx context.Context, key string) error {
 // List returns the storage keys of every object under the store's prefix whose key
 // begins with the caller's prefix, lexicographically ascending and duplicate-free.
 // It runs "rclone lsf --files-only -R" rooted at "<remote>:<prefix>": the emitted
-// paths are relative to that root, so they ARE the storage keys. The caller's
-// prefix is applied locally (it need not fall on a directory boundary) and is NOT
-// name-validated. The result is sorted locally — rclone's ordering is not trusted.
-// An empty store surfaces as a not-found on the root directory, which maps to an
-// empty listing rather than an error.
+// paths are relative to that root, and each object path is decoded back to its
+// key (decodeLeaf); entries that are not "@blob" leaves are skipped. The caller's
+// prefix is applied to the DECODED key (it need not fall on a directory boundary)
+// and is NOT name-validated. The result is sorted locally — rclone's ordering is
+// not trusted, and the encoded order would put "a/b" before "a". An empty store
+// surfaces as a not-found on the root directory, which maps to an empty listing
+// rather than an error.
+//
+// List fails closed with *LegacyLayoutError if the listing holds a bare-path
+// object (isLegacyLeaf) anywhere under the store root, whatever the prefix: New
+// refused such a root, so one appearing later was written by an rclonestore <=
+// v0.4.x (a rollback) and would otherwise be silently invisible. The check costs
+// nothing — the recursive listing is already in hand.
 func (b *blobStore) List(ctx context.Context, prefix string) ([]string, error) {
-	var out bytes.Buffer
-	if err := b.r.run(ctx, "lsf", []string{"--files-only", "-R"}, []string{b.listRoot()}, nil, &out); err != nil {
-		if isNotFound(err) {
-			return nil, nil
-		}
+	rels, err := b.listObjects(ctx)
+	if err != nil {
 		return nil, err
+	}
+	if legacy, found := firstLegacyLeaf(rels); found {
+		return nil, &LegacyLayoutError{Path: legacy}
 	}
 
 	seen := make(map[string]struct{})
 	var keys []string
-	for _, line := range strings.Split(out.String(), "\n") {
-		key := strings.TrimRight(line, "\r")
-		if key == "" {
+	for _, rel := range rels {
+		key, ok := decodeLeaf(rel)
+		if !ok {
 			continue
 		}
 		if !strings.HasPrefix(key, prefix) {
@@ -209,14 +275,73 @@ func (b *blobStore) List(ctx context.Context, prefix string) ([]string, error) {
 	return keys, nil
 }
 
-// exists probes whether the object at path is present, using "rclone lsf
+// listObjects returns every object path under the store root, relative to it, as
+// emitted by "rclone lsf --files-only -R" (blank lines and CRs dropped, order as
+// rclone emitted it). A not-found root is an empty store. Every other failure
+// propagates as the runner's *RcloneError.
+func (b *blobStore) listObjects(ctx context.Context) ([]string, error) {
+	var out bytes.Buffer
+	if err := b.r.run(ctx, "lsf", []string{"--files-only", "-R"}, []string{b.listRoot()}, nil, &out); err != nil {
+		if isNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var rels []string
+	for _, line := range strings.Split(out.String(), "\n") {
+		rel := strings.TrimRight(line, "\r")
+		if rel == "" {
+			continue
+		}
+		rels = append(rels, rel)
+	}
+	return rels, nil
+}
+
+// firstLegacyLeaf returns the lexically first legacy-shaped object path in rels,
+// so the one a refusal names does not depend on rclone's listing order.
+func firstLegacyLeaf(rels []string) (string, bool) {
+	first, found := "", false
+	for _, rel := range rels {
+		if !isLegacyLeaf(rel) {
+			continue
+		}
+		if !found || rel < first {
+			first, found = rel, true
+		}
+	}
+	return first, found
+}
+
+// refuseLegacyLayout is New's fail-closed check for a store root written by
+// rclonestore <= v0.4.x: one recursive listing of the root (the same cost as one
+// List call), refusing on the first legacy-shaped object path. There is no
+// migration — the owner abandons pre-v0.5.0 data — and no marker object: a marker
+// would be a second authority and would miss a later bare-path write by a
+// rolled-back binary, which this check (and List) still catch. A listing failure
+// is a *LayoutScanError, never read as clean and never as legacy.
+func refuseLegacyLayout(ctx context.Context, b *blobStore) error {
+	rels, err := b.listObjects(ctx)
+	if err != nil {
+		return &LayoutScanError{cause: err}
+	}
+	if legacy, found := firstLegacyLeaf(rels); found {
+		return &LegacyLayoutError{Path: legacy}
+	}
+	return nil
+}
+
+// exists probes whether the blob object at path is present, using "rclone lsf
 // --files-only" pointed at the exact object path. rclone resolves a remote:path
-// that names a file to that single file, so a present object yields a non-empty
-// listing (its leaf) and an absent one yields either a not-found exit or empty
-// output — both reported as absent. Any non-not-found failure (auth, network)
-// propagates, so a transient error is never mistaken for "absent" and silently
-// overwritten by Put.
-func (b *blobStore) exists(ctx context.Context, path string) (bool, error) {
+// that names a file to that single file and prints its leaf name, so the object is
+// present only when the output is EXACTLY one line equal to leaf. A path that is a
+// DIRECTORY instead lists its children — which is not the blob, so it is reported
+// absent and Put's rcat decides (a filesystem remote refuses to write over a
+// directory with an *RcloneError). It is never read as present, so a directory can
+// never be cat'd and reported as a conflicting blob. Not-found exits and empty
+// output are absent. Any non-not-found failure (auth, network) propagates, so a
+// transient error is never mistaken for "absent" and silently overwritten by Put.
+func (b *blobStore) exists(ctx context.Context, path, leaf string) (bool, error) {
 	var out bytes.Buffer
 	if err := b.r.run(ctx, "lsf", []string{"--files-only"}, []string{path}, nil, &out); err != nil {
 		if isNotFound(err) {
@@ -224,7 +349,12 @@ func (b *blobStore) exists(ctx context.Context, path string) (bool, error) {
 		}
 		return false, err
 	}
-	return strings.TrimSpace(out.String()) != "", nil
+	return strings.TrimRight(out.String(), "\r\n") == leaf, nil
+}
+
+// lastSegment returns the final '/'-separated segment of a validated key.
+func lastSegment(key string) string {
+	return key[strings.LastIndexByte(key, '/')+1:]
 }
 
 // rcat streams r straight to "rclone rcat", which reads the object body from stdin.
@@ -234,12 +364,12 @@ func (b *blobStore) rcat(ctx context.Context, path string, r io.Reader) error {
 	return b.r.run(ctx, "rcat", nil, []string{path}, r, io.Discard)
 }
 
-// objectPath builds the single positional path for a key: the key joined under
-// the store prefix, appended to the remote in its correct form (see remoteJoin).
+// objectPath builds the single positional path for a key: the key's encoded
+// object path (encodeLeaf) joined under the store prefix, appended to the remote in its correct form (see remoteJoin).
 // The runner inserts "--" before this positional, so a key or remote beginning
 // with '-' can never be parsed as a flag.
 func (b *blobStore) objectPath(key string) string {
-	return b.remoteJoin(joinPath(b.prefix, key))
+	return b.remoteJoin(joinPath(b.prefix, encodeLeaf(key)))
 }
 
 // listRoot is the recursive-listing (and startup-probe) root: the store prefix
