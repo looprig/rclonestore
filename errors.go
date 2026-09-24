@@ -34,12 +34,17 @@ func (e *PersistencePathError) Unwrap() error { return e.cause }
 //     nor the global --config path (which points at a file that may hold remote
 //     credentials). The caller passes only non-secret subflags.
 //   - ExitCode   — the process exit status; -1 for a start failure or a signal kill.
-//   - Stderr     — a bounded tail (~4 KiB) of the process's stderr, surfaced as-is
-//     from rclone (whose diagnostics do not echo config secrets) and bounded so it
-//     cannot balloon an error or log line.
+//   - Stderr     — a bounded tail (~4 KiB) of the process's stderr, REDACTED before
+//     capture: rclone echoes the remote it was given, inline ":backend,key=value:"
+//     credentials included, so the inline spec is rewritten to
+//     ":backend,<redacted>:" and every parameter value and the --config path to
+//     "<redacted>" (including a secret cut by the tail bound). A named remote's
+//     credentials live in the config file, which rclone does not echo.
 //
-// The config path, the remote, and every positional are excluded by construction,
-// so an RcloneError is always safe to log.
+// The config path, inline remote parameters, and every positional are excluded by
+// construction, so an RcloneError is safe to log. Credentials supplied any other
+// way rclone might print (e.g. RCLONE_* environment variables) are outside what
+// rclonestore can see and are not redacted.
 type RcloneError struct {
 	Subcommand string
 	Args       []string

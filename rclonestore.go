@@ -30,6 +30,7 @@ var namedRemoteRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 type parsedRemote struct {
 	connectionString bool
 	backend          string
+	spec             string // text between the leading ':' and the spec-ending ':' (backend plus any ",params")
 	path             string
 }
 
@@ -109,7 +110,12 @@ func New(opts Options) (*Store, error) {
 		return nil, &BinaryError{Binary: name, cause: err}
 	}
 
-	r := &runner{binary: resolved, configPath: opts.ConfigPath, timeout: opts.Timeout}
+	r := &runner{
+		binary:     resolved,
+		configPath: opts.ConfigPath,
+		timeout:    opts.Timeout,
+		redact:     newRedactor(remote, opts.ConfigPath),
+	}
 	bs := newBlobStore(r, opts.Remote, opts.Prefix, paths)
 
 	if err := probe(bs); err != nil {
@@ -267,7 +273,7 @@ func parseRemote(remote string) (parsedRemote, error) {
 				if !validBackendName(backend) {
 					return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "malformed connection string (want :backend:[path])"}
 				}
-				return parsedRemote{connectionString: true, backend: backend, path: remote[i+1:]}, nil
+				return parsedRemote{connectionString: true, backend: backend, spec: backendSpec, path: remote[i+1:]}, nil
 			}
 		}
 		return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "malformed connection string (want balanced quoted parameters and :backend:[path])"}

@@ -24,6 +24,12 @@ thin, security-hardened exec adapter — nothing more.
   path only; never parse, copy, or log it. Capture only a bounded TAIL of stderr into typed
   errors. Never put the config path, the remote, or any credential-bearing value into an error
   message or a log line — only the rclone subcommand (and, at the Blobs layer, the storage key).
+- **rclone's stderr DOES echo the remote** — verbatim and Go-quoted, inline `key=value`
+  credentials included (measured: `deletefile`, the CRITICAL `Failed to create file system for
+  "…"` line, `-vv`). Every captured stderr byte therefore goes through `redactor` (redact.go)
+  before it reaches an `RcloneError`: the inline spec becomes `:backend,<redacted>:`, every
+  parameter value and the config path become `<redacted>`, and a secret cut by the tail bound is
+  dropped. Never surface stderr (or stdout) through any other path.
 
 ## Code rules
 

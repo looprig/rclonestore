@@ -26,6 +26,7 @@ type blobFakeSpec struct {
 	// lsf WITHOUT -R: the startup probe (New) and Put's existence probe.
 	lsfOut  string // stdout emitted for a non-recursive lsf (the exact leaf line = present)
 	lsfExit int    // non-recursive lsf exit status (3/4 = not-found → absent)
+	lsfErr  string // stderr emitted for a non-recursive lsf
 
 	// lsf WITH -R: the recursive listing behind List and New's legacy-layout scan.
 	lsROut  string // stdout emitted for a recursive lsf (one store-relative path per line)
@@ -67,6 +68,9 @@ func writeBlobFake(t *testing.T, dir string, spec blobFakeSpec) string {
 	b.WriteString("fi; done\n")
 	b.WriteString("printf '%s\\n' \"$@\" > " + q(dir) + "/argv.lsf\n")
 	b.WriteString("printf '%s' " + q(spec.lsfOut) + "\n")
+	if spec.lsfErr != "" {
+		b.WriteString("printf '%s' " + q(spec.lsfErr) + " >&2\n")
+	}
 	b.WriteString("exit " + strconv.Itoa(spec.lsfExit) + "\n;;\n")
 
 	b.WriteString("cat)\n")
@@ -359,6 +363,13 @@ func TestBlobsPut(t *testing.T) {
 			wantNoCat: true,
 		},
 		{
+			name:       "probe failure beside the missing-config notice propagates (never absent)",
+			spec:       blobFakeSpec{lsfExit: 1, lsfOut: "", lsfErr: "NOTICE: Config file \"/c\" not found - using defaults\nERROR : 403 Forbidden\n"},
+			body:       content,
+			wantErr:    func(t *testing.T, err error) { requireRcloneExit(t, err, 1) },
+			wantNoRcat: true,
+		},
+		{
 			name:    "lsf probe hard-error propagates (not swallowed as absent)",
 			spec:    blobFakeSpec{lsfExit: 5, lsfOut: ""}, // exit 5 = temporary error, not not-found
 			body:    content,
@@ -482,6 +493,21 @@ func TestBlobsGet(t *testing.T) {
 		{
 			name:    "absent via stderr marker under non-standard exit code",
 			spec:    blobFakeSpec{catExit: 1, catErr: "Failed to open: object not found\n"},
+			wantErr: func(t *testing.T, err error) { requireBlobNotFound(t, err, key) },
+		},
+		{
+			// rclone prints this notice on every call when no config file exists
+			// (the norm with connection-string remotes); its "not found" is about
+			// the config, not the object, and must not turn a failure into absence.
+			name: "missing-config notice is not an object not-found",
+			spec: blobFakeSpec{catExit: 1, catErr: "2026/09/24 NOTICE: Config file \"/home/u/.config/rclone/rclone.conf\" not found - using defaults\n" +
+				"2026/09/24 ERROR : Failed to cat: 403 Forbidden\n"},
+			wantErr: func(t *testing.T, err error) { requireRcloneExit(t, err, 1) },
+		},
+		{
+			name: "a real not-found beside the missing-config notice is still not-found",
+			spec: blobFakeSpec{catExit: 1, catErr: "NOTICE: Config file \"/c\" not found - using defaults\n" +
+				"ERROR : Failed to cat: object not found\n"},
 			wantErr: func(t *testing.T, err error) { requireBlobNotFound(t, err, key) },
 		},
 		{

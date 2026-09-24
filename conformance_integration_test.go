@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -131,6 +132,33 @@ func TestLocalDirectoryIsNeverAConflictingBlob(t *testing.T) {
 	var re *RcloneError
 	if !errors.As(err, &re) {
 		t.Fatalf("Put over a directory = %T %v, want *RcloneError from rcat", err, err)
+	}
+}
+
+// TestRealRcloneErrorRedactsInlineSecrets forces a real rclone failure whose
+// stderr echoes the connection string (an invalid option makes rclone print the
+// whole remote, Go-quoted, and the rejected value on its own) and asserts no
+// inline parameter value reaches the returned error.
+func TestRealRcloneErrorRedactsInlineSecrets(t *testing.T) {
+	requireRclone(t)
+	root := t.TempDir()
+	remote := ":local,description='PROBE:SECRET,x',links=NOTABOOLSECRET:" + root
+	_, err := New(Options{Remote: remote})
+	var pe *ProbeError
+	if !errors.As(err, &pe) {
+		t.Fatalf("New = %v, want *ProbeError", err)
+	}
+	var re *RcloneError
+	if !errors.As(err, &re) || re.Stderr == "" {
+		t.Fatalf("no rclone stderr captured to check: %v", err)
+	}
+	for _, secret := range []string{"PROBE", "SECRET", "NOTABOOL"} {
+		if strings.Contains(err.Error(), secret) || strings.Contains(re.Stderr, secret) {
+			t.Fatalf("rclone error leaks %q: %q", secret, err.Error())
+		}
+	}
+	if !strings.Contains(re.Stderr, ":local,<redacted>:") {
+		t.Fatalf("stderr lost the redacted remote form: %q", re.Stderr)
 	}
 }
 

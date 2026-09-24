@@ -12,9 +12,10 @@ import (
 )
 
 // stderrTailBytes bounds how many trailing bytes of a failed rclone invocation's
-// stderr are retained in a RcloneError. rclone's own diagnostics do not echo config
-// secrets, but the tail is bounded regardless so a pathological run cannot balloon
-// an error value or a log line.
+// stderr are retained in a RcloneError, so a pathological run cannot balloon an
+// error value or a log line. rclone's diagnostics DO echo the remote (inline
+// credentials included), so the capture is redacted before it is retained; see
+// redactor.
 const stderrTailBytes = 4 << 10 // 4 KiB
 
 // runner executes a single rclone subcommand as a context-bounded subprocess. It
@@ -26,6 +27,7 @@ type runner struct {
 	binary     string        // path to the rclone binary (resolved by the caller)
 	configPath string        // optional --config path; referenced only, never read or logged here
 	timeout    time.Duration // optional per-call bound; 0 relies on the caller's ctx alone
+	redact     redactor      // removes inline-remote credentials and the config path from captured stderr
 }
 
 // run executes:
@@ -55,7 +57,9 @@ func (r *runner) run(ctx context.Context, subcommand string, subflags, positiona
 	cmd := exec.CommandContext(ctx, r.binary, args...) // #nosec G204 -- argv-only (no shell), ctx-bounded, `--` before positionals; see CLAUDE.md
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
-	tail := &tailWriter{max: stderrTailBytes}
+	// Capture margin extra bytes so a secret cut by the bound can be dropped after
+	// redaction without shrinking the retained tail below stderrTailBytes.
+	tail := &tailWriter{max: stderrTailBytes + r.redact.margin()}
 	cmd.Stderr = tail
 
 	if err := cmd.Run(); err != nil {
@@ -69,7 +73,7 @@ func (r *runner) run(ctx context.Context, subcommand string, subflags, positiona
 			Subcommand: subcommand,
 			Args:       append([]string(nil), subflags...),
 			ExitCode:   exitCode(err),
-			Stderr:     string(tail.tail()),
+			Stderr:     r.redact.redactTail(tail.tail(), tail.truncated(), stderrTailBytes),
 			cause:      cause,
 		}
 	}
@@ -109,12 +113,14 @@ func exitCode(err error) int {
 // trailing max bytes. Not safe for concurrent use; exec writes stderr from one
 // goroutine and the tail is read only after cmd.Run returns.
 type tailWriter struct {
-	max int
-	buf []byte
+	max   int
+	buf   []byte
+	total int // bytes ever written, to tell whether the tail lost its start
 }
 
 func (w *tailWriter) Write(p []byte) (int, error) {
 	n := len(p)
+	w.total += n
 	if w.max <= 0 {
 		return n, nil
 	}
@@ -134,3 +140,6 @@ func (w *tailWriter) Write(p []byte) (int, error) {
 }
 
 func (w *tailWriter) tail() []byte { return w.buf }
+
+// truncated reports whether bytes were discarded from the front of the tail.
+func (w *tailWriter) truncated() bool { return w.total > len(w.buf) }

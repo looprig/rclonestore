@@ -99,8 +99,9 @@ rclonestore: a foreign object spelled like a storage name is indistinguishable f
 and is refused too. **One-way:** ≤ v0.4.x does not understand a v0.5.0 root (its `Get` finds
 nothing and its `List` reports `…@blob` names), so never roll a root back.
 
-The scan is one recursive listing of the root at every `New` — the same cost as one `List` call,
-which on a large bucket is many list requests. A scan failure is `*LayoutScanError` (wrapping
+The scan is one recursive listing of the root at every `New` — the same cost as one `List` call.
+On a large bucket that is many paged list requests (roughly one per 1,000 objects on S3) at every
+construction; this is accepted, not an oversight. Open a `Store` once and reuse it. A scan failure is `*LayoutScanError` (wrapping
 the `*RcloneError`), never read as clean or as legacy.
 
 ### Startup probe
@@ -121,6 +122,15 @@ location lists its children instead, so it is never taken for the blob and never
 A bucket-based remote cats an absent key as nothing with exit 0, so `Get` confirms an empty
 result with the same probe and reports `*BlobNotFoundError` unless the object exists.
 
+**Known limit:** `Get` of a key whose `<key>@blob` location is a *directory* (only possible if
+something other than rclonestore wrote into the root) returns the concatenation of that
+directory's files, because `rclone cat` of a directory does so. Confirming every read would
+double `Get`'s cost, so it is not done; keep the root dedicated.
+
+rclone prints `Config file "…" not found - using defaults` on every call when no config file
+exists. That line is never taken as an object not-found; only exit codes 3/4 or a "not found" on
+any other stderr line are.
+
 ## Security posture
 
 - **argv exec only — never a shell string.** `exec.CommandContext` with every argument as a
@@ -131,6 +141,13 @@ result with the same probe and reports `*BlobNotFoundError` unless the object ex
 - **No secrets in errors or logs.** rclone config may embed credentials — it is referenced by
   path only. Errors carry only the rclone subcommand, safe subflags, the exit code, and a
   bounded (~4 KiB) tail of stderr; never the config path, the remote, or any positional.
+  **rclone's own diagnostics do echo the remote**, inline `key=value` credentials included, so
+  the stderr tail is **redacted before capture**: `:s3,access_key_id=…,secret_access_key=…:bkt`
+  becomes `:s3,<redacted>:bkt`, every inline parameter value and the config path become
+  `<redacted>` wherever they appear (a value that is also ordinary text is over-redacted), and a
+  secret cut by the tail bound is dropped. Credentials passed through `RCLONE_*` environment
+  variables are invisible to rclonestore and are not redacted — prefer a named remote with its
+  secrets in the config file.
   `OptionsError` names the offending field and rule but never the offending value (a
   connection-string `Remote` can embed secrets), and `ProbeError` does not carry the remote.
 - **Never links librclone / cgo** — rclone is driven as a subprocess only.

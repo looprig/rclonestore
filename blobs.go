@@ -417,7 +417,8 @@ func joinPath(prefix, rest string) string {
 // isNotFound reports whether err is a not-found from rclone. It classifies on the
 // runner's *RcloneError, primarily by exit code (3 directory-not-found, 4
 // file-not-found per rclone's documented table) and secondarily by a "not found"
-// stderr marker for remotes that surface not-found through another code. It never
+// stderr marker for remotes that surface not-found through another code — on any
+// stderr line except rclone's missing-config notice (isMissingConfigNotice). It never
 // inspects the remote or the positional path (RcloneError excludes them), so no
 // credential can leak through classification.
 //
@@ -433,5 +434,22 @@ func isNotFound(err error) bool {
 	if re.ExitCode == exitDirNotFound || re.ExitCode == exitFileNotFound {
 		return true
 	}
-	return strings.Contains(strings.ToLower(re.Stderr), notFoundMarker)
+	for _, line := range strings.Split(re.Stderr, "\n") {
+		if isMissingConfigNotice(line) {
+			continue
+		}
+		if strings.Contains(strings.ToLower(line), notFoundMarker) {
+			return true
+		}
+	}
+	return false
+}
+
+// isMissingConfigNotice reports rclone's per-invocation notice that no config
+// file exists (`NOTICE: Config file "<path>" not found - using defaults`). It is
+// printed on EVERY call when there is no rclone.conf — the norm with
+// connection-string remotes — and its "not found" is about the config file, not
+// the object, so it must never turn an auth or network failure into "absent".
+func isMissingConfigNotice(line string) bool {
+	return strings.Contains(line, "Config file ") && strings.Contains(line, "not found - using defaults")
 }
