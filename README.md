@@ -10,6 +10,26 @@ every call bounded by a `context.Context`, and rclone's config (which may embed 
 credentials) referenced by path only: never parsed, copied, logged, or placed in an error.
 It depends only on the Go standard library and `github.com/looprig/storage`.
 
+## Status
+
+- Implements the **Blobs** primitive only (`Put`/`Get`/`Delete`/`List`) plus storage's optional
+  `PathReporter` capability. It conforms to the `github.com/looprig/storage` v0.7.0 contract,
+  including its nested-name Blobs cases.
+- **v0.5.0 changed the object layout with no migration, one-way**: `New` refuses a root written
+  by rclonestore ≤ v0.4.x with `ErrLegacyLayout` (see "Object layout" below).
+- It does **not** implement `storage.BlobReaderLifecycle` (bounded Blob reader shutdown), so a
+  consumer that requires it, such as `sessionstore.Open`, rejects it.
+- Requires an `rclone` binary at run time.
+
+## Install
+
+```sh
+go get github.com/looprig/rclonestore@latest
+```
+
+It sits in tier 1 of the Looprig graph (foundation adapters); its only Looprig dependency is
+`github.com/looprig/storage`.
+
 ## Usage
 
 ```go
@@ -227,8 +247,8 @@ All errors are typed; classify with `errors.As`.
 ## Testing
 
 ```sh
-GOWORK=off make check                          # gofmt + vet + gosec + race unit tests
-GOWORK=off go test -tags integration -race ./... # storage Blobs conformance vs. real rclone
+make check                                     # fmt-check, vet, staticcheck, gosec, govulncheck, race unit tests, build
+make test-integration                          # GOWORK=off go test -tags integration -race ./... (real rclone)
 RCLONESTORE_CONFORMANCE_REMOTE=':s3,provider=Other,endpoint=…:bucket' \
   GOWORK=off go test -tags integration -race -run ConformanceRemote ./... # …and vs. another remote
 ```
@@ -237,12 +257,17 @@ The unit tests drive a generated fake `rclone` (per-test `#!/bin/sh` script) and
 the network. The **conformance** suite (`//go:build integration`) runs storage's
 `storetest.TestBlobs` against a **real** `rclone` using the LOCAL backend
 (`:local:<temp dir>`) — no cloud credentials — and **skips** (never fails) when `rclone` is
-not on PATH. It is the harness that validates the not-found exit-code classification (3/4 plus
-the stderr marker), the remote-form-aware object path, and the `lsf`-on-a-file existence probe
+not on PATH. It is the harness that validates the not-found exit-code classification (3/4), the
+remote-form-aware object path, and the `lsf`-on-a-file existence probe
 against real rclone, together with the storage v0.7.0 nested-key cases, the legacy-layout
 refusal and the directory-is-not-a-conflict case on a real `:local:` root. Setting
 `RCLONESTORE_CONFORMANCE_REMOTE` to any remote (for example an S3-compatible bucket) runs the same
 suite there, one fresh prefix per backend instance.
 
-Every Go command runs with **`GOWORK=off`** so the parent `go.work` at `~/code` never captures
-this module.
+The baseline is Go 1.26.8. Every Go command (and every make target) runs with **`GOWORK=off`**,
+so a module is verified against its pinned dependencies rather than a workspace;
+`GOWORK=off go test ./...` runs the unit tests. `examples/blob-remote` is a runnable example.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
