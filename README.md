@@ -142,6 +142,45 @@ make `Get` report a missing blob and `Put` upload over an object it failed to pr
 that reported not-found some other way would fail loudly instead (both `:local:` and S3 use
 3/4).
 
+## rclone environment (deny by default)
+
+rclone reads every global flag from an `RCLONE_<FLAG>` environment variable and every backend
+option from `RCLONE_<BACKEND>_<OPTION>`. Inherited unchanged, several of these silently break the
+store: `RCLONE_PROGRESS` writes transfer stats into `Get`'s bytes and defeats `Put`'s conflict
+check, while `RCLONE_DRY_RUN` and `RCLONE_INTERACTIVE` make `Put` succeed having written nothing
+(all measured with rclone v1.71.1). rclonestore therefore **drops every `RCLONE_*` variable from
+the rclone child's environment except this allowlist** (names compared case-insensitively):
+
+| Allowed | Why |
+|---|---|
+| `RCLONE_CONFIG` | config file path (`ConfigPath`, passed as `--config`, takes precedence) |
+| `RCLONE_CONFIG_*` | `RCLONE_CONFIG_PASS`, `RCLONE_CONFIG_DIR`, and **environment-defined remotes** `RCLONE_CONFIG_<REMOTE>_<OPTION>` |
+| `RCLONE_PASSWORD_COMMAND`, `RCLONE_ASK_PASSWORD` | decrypting an encrypted config |
+| `RCLONE_CONTIMEOUT`, `RCLONE_TIMEOUT`, `RCLONE_EXPECT_CONTINUE_TIMEOUT` | timeouts |
+| `RCLONE_RETRIES`, `RCLONE_RETRIES_SLEEP`, `RCLONE_LOW_LEVEL_RETRIES` | retries |
+| `RCLONE_CA_CERT`, `RCLONE_CLIENT_CERT`, `RCLONE_CLIENT_KEY`, `RCLONE_CLIENT_PASS`, `RCLONE_NO_CHECK_CERTIFICATE` | TLS |
+| `RCLONE_BWLIMIT`, `RCLONE_BWLIMIT_FILE`, `RCLONE_TPSLIMIT`, `RCLONE_TPSLIMIT_BURST` | rate limits |
+| `RCLONE_USER_AGENT`, `RCLONE_BIND`, `RCLONE_DISABLE_HTTP2`, `RCLONE_DISABLE_HTTP_KEEP_ALIVES`, `RCLONE_DSCP` | networking |
+
+Everything else named `RCLONE_*` is dropped. That includes the logging, progress, dry-run and
+interactive flags, `RCLONE_RC*`, `RCLONE_HEADER*`, `RCLONE_METADATA_SET`, `RCLONE_DISABLE`, and
+**all backend options such as `RCLONE_S3_REGION`**. Put backend options in the connection string
+or the config file (or define the remote with `RCLONE_CONFIG_<REMOTE>_*`). Variables not named
+`RCLONE_*`, such as `HTTPS_PROXY`, `HOME`, `PATH` and cloud SDK credentials like `AWS_*`, pass
+through unchanged.
+
+## Known limits
+
+- **A misnamed bucket or container reads as absent.** rclone reports a missing bucket with the
+  same not-found exit code as a missing object, so `Get` answers `BlobNotFoundError`, `List` is
+  empty, and the first `Put` creates the bucket. Check the remote name when a store looks
+  unexpectedly empty.
+- **Quote any inline value that contains `:` or `,`.** rclone ends an unquoted value at the first
+  `:`. An unquoted secret containing `:` is split: the part after the colon becomes the remote
+  **path**, which rclone echoes and rclonestore does not redact, because a path is not a secret.
+- `Get` of a foreign *directory* at an object's location, newline-named foreign files and the
+  cost of `New`'s scan are described in the sections above.
+
 ## Security posture
 
 - **argv exec only — never a shell string.** `exec.CommandContext` with every argument as a
@@ -160,12 +199,9 @@ that reported not-found some other way would fail loudly instead (both `:local:`
   - **Exact spellings only.** Redaction matches a value verbatim, as rclone unquotes it, and
     Go-escaped (`%q`). A value rclone or an SDK *transforms* — URL-encoded (a SAS or endpoint
     userinfo inside a request URL), reordered query parameters, case-folded — is not matched.
-  - **Log grammar is pinned** by removing rclone's logging variables (`RCLONE_VERBOSE`,
-    `RCLONE_QUIET`, `RCLONE_USE_JSON_LOG`, `RCLONE_LOG_*`, `RCLONE_SYSLOG*`, `RCLONE_DUMP*`, …)
-    from the child's environment; argv flags cannot override them. All other variables pass
-    through.
-  - **Not covered:** credentials supplied through `RCLONE_*` backend variables are invisible to
-    rclonestore and are not redacted; and an inline connection string is in rclone's **argv**,
+  - **The rclone child environment is deny-by-default** (see "rclone environment" above), so
+    the log grammar is pinned: argv flags cannot override rclone's logging variables.
+  - **Not covered:** an inline connection string is in rclone's **argv**,
     so any local user who can list processes (`ps`, `/proc/<pid>/cmdline`) can read it while a
     call runs. **Prefer a named remote with its secrets in the config file.**
   `OptionsError` names the offending field and rule but never the offending value (a

@@ -5,6 +5,9 @@ package rclonestore
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -110,5 +113,72 @@ func TestInheritedLogEnvCannotDefeatRedaction(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestInheritedDataPathEnvIsNeutralised (regate M4): inherited RCLONE_<FLAG>
+// variables that change rclone's output or writes must not reach it. Measured
+// before the fix: PROGRESS appended stats to Get's bytes and turned a
+// conflicting re-Put into a silent overwrite; DRY_RUN and INTERACTIVE made Put
+// return nil having written nothing. Not parallel: it sets process environment.
+func TestInheritedDataPathEnvIsNeutralised(t *testing.T) {
+	requireRclone(t)
+	for _, env := range [][2]string{
+		{"RCLONE_PROGRESS", "true"},
+		{"RCLONE_DRY_RUN", "true"},
+		{"RCLONE_INTERACTIVE", "true"},
+		{"RCLONE_MAX_DELETE", "0"},
+	} {
+		t.Run(env[0], func(t *testing.T) {
+			t.Setenv(env[0], env[1])
+			ctx := context.Background()
+			s, err := New(Options{Remote: ":local:" + t.TempDir()})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if err := s.Put(ctx, "sessions/k", strings.NewReader("hello")); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			rc, err := s.Get(ctx, "sessions/k")
+			if err != nil {
+				t.Fatalf("Get after Put: %v (the write was dropped)", err)
+			}
+			got, rerr := io.ReadAll(rc)
+			if rerr != nil || string(got) != "hello" {
+				t.Fatalf("Get = %q, %v; want exactly %q", got, rerr, "hello")
+			}
+			_ = rc.Close()
+			var conflict *storage.BlobConflictError
+			if err := s.Put(ctx, "sessions/k", strings.NewReader("different")); !errors.As(err, &conflict) {
+				t.Fatalf("different-content re-Put = %v, want *BlobConflictError", err)
+			}
+			if err := s.Delete(ctx, "sessions/k"); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			var nf *storage.BlobNotFoundError
+			if _, err := s.Get(ctx, "sessions/k"); !errors.As(err, &nf) {
+				t.Fatalf("Get after Delete = %v, want *BlobNotFoundError (the delete was dropped)", err)
+			}
+		})
+	}
+}
+
+// TestEnvDefinedRemoteStillWorks: RCLONE_CONFIG_<REMOTE>_* is on the allowlist,
+// so a remote defined only in the environment (here an alias onto a temp dir)
+// still resolves as a named remote.
+func TestEnvDefinedRemoteStillWorks(t *testing.T) {
+	requireRclone(t)
+	root := t.TempDir()
+	t.Setenv("RCLONE_CONFIG_RSENVREMOTE_TYPE", "alias")
+	t.Setenv("RCLONE_CONFIG_RSENVREMOTE_REMOTE", root)
+	s, err := New(Options{Remote: "rsenvremote", Prefix: "pfx", PersistencePaths: []string{root}})
+	if err != nil {
+		t.Fatalf("New(env-defined remote): %v", err)
+	}
+	if err := s.Put(context.Background(), "a/b", strings.NewReader("env")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "pfx", "a", "b@blob")); err != nil || string(data) != "env" {
+		t.Fatalf("object not written through the env-defined remote: %q, %v", data, err)
 	}
 }

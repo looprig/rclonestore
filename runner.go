@@ -147,47 +147,86 @@ func (w *tailWriter) tail() []byte { return w.buf }
 // truncated reports whether bytes were discarded from the front of the tail.
 func (w *tailWriter) truncated() bool { return w.total > len(w.buf) }
 
-// scrubbedEnvNames are the RCLONE_* variables that change rclone's log grammar,
-// level or destination. The child never inherits them, so its stderr is always
-// the default NOTICE-level text log the redactor's needles describe. argv flags
-// cannot do this (measured, rclone v1.71.1): with --use-json-log=false,
-// RCLONE_USE_JSON_LOG=true and RCLONE_LOG_FORMAT=json still emit JSON (which
-// escapes a secret into a spelling no needle matches), RCLONE_LOG_LEVEL=DEBUG
-// still wins, and RCLONE_VERBOSE/RCLONE_QUIET make --log-level fatal. The
-// RCLONE_DUMP family is dropped too: it logs request headers and bodies.
-var scrubbedEnvNames = map[string]struct{}{
-	"RCLONE_VERBOSE":         {},
-	"RCLONE_QUIET":           {},
-	"RCLONE_USE_JSON_LOG":    {},
-	"RCLONE_SYSLOG":          {},
-	"RCLONE_SYSLOG_FACILITY": {},
-	"RCLONE_STATS_LOG_LEVEL": {},
-	"RCLONE_DUMP":            {},
+// rclone maps EVERY global flag to an RCLONE_<FLAG> environment variable (and
+// backend options to RCLONE_<BACKEND>_<OPTION>), and the child would inherit
+// them. Many change the data path or the output rclonestore parses — measured
+// with rclone v1.71.1: RCLONE_PROGRESS writes transfer stats into Get's stdout
+// and defeats Put's exact-leaf conflict probe; RCLONE_DRY_RUN and
+// RCLONE_INTERACTIVE make Put return success having written nothing; the log
+// family (RCLONE_LOG_*, RCLONE_USE_JSON_LOG, RCLONE_VERBOSE, …) changes the
+// stderr grammar redaction relies on, and argv flags cannot override it. So the
+// child environment is DENY BY DEFAULT: every RCLONE_* variable is dropped except
+// this allowlist, each checked against rclone v1.71.1 and neutral to what is read
+// or written, the output format, interactivity and dry-run:
+//
+//   - RCLONE_CONFIG (the config file path) and RCLONE_CONFIG_* (RCLONE_CONFIG_PASS,
+//     RCLONE_CONFIG_DIR and env-defined remotes RCLONE_CONFIG_<REMOTE>_<OPTION>);
+//   - config decryption: RCLONE_PASSWORD_COMMAND, RCLONE_ASK_PASSWORD;
+//   - transport tuning (fs/config.go, configflags): timeouts, retries, TLS
+//     material, bandwidth/transaction limits, user agent, bind address, HTTP/2 and
+//     keep-alive switches, DSCP.
+//
+// Excluded on purpose, among others: RCLONE_HEADER* and RCLONE_METADATA_SET
+// (they change requests and stored metadata), RCLONE_DISABLE (feature
+// switches), RCLONE_RC* (would start an rc server per call), and every backend
+// option such as RCLONE_S3_VERSION_AT or RCLONE_LOCAL_ENCODING (they change what
+// is read or how names map) — put backend options in the connection string or the
+// config file. Variables not named RCLONE_* (HTTP(S)_PROXY, HOME, PATH, cloud SDK
+// credentials such as AWS_*) pass through untouched.
+var allowedRcloneEnv = map[string]struct{}{
+	"RCLONE_CONFIG":                   {},
+	"RCLONE_PASSWORD_COMMAND":         {},
+	"RCLONE_ASK_PASSWORD":             {},
+	"RCLONE_CONTIMEOUT":               {},
+	"RCLONE_TIMEOUT":                  {},
+	"RCLONE_EXPECT_CONTINUE_TIMEOUT":  {},
+	"RCLONE_RETRIES":                  {},
+	"RCLONE_RETRIES_SLEEP":            {},
+	"RCLONE_LOW_LEVEL_RETRIES":        {},
+	"RCLONE_CA_CERT":                  {},
+	"RCLONE_CLIENT_CERT":              {},
+	"RCLONE_CLIENT_KEY":               {},
+	"RCLONE_CLIENT_PASS":              {},
+	"RCLONE_NO_CHECK_CERTIFICATE":     {},
+	"RCLONE_BWLIMIT":                  {},
+	"RCLONE_BWLIMIT_FILE":             {},
+	"RCLONE_TPSLIMIT":                 {},
+	"RCLONE_TPSLIMIT_BURST":           {},
+	"RCLONE_USER_AGENT":               {},
+	"RCLONE_BIND":                     {},
+	"RCLONE_DISABLE_HTTP2":            {},
+	"RCLONE_DISABLE_HTTP_KEEP_ALIVES": {},
+	"RCLONE_DSCP":                     {},
 }
 
-// scrubbedEnvPrefixes cover the variable families (RCLONE_LOG_LEVEL,
-// RCLONE_LOG_FORMAT, RCLONE_LOG_FILE*, RCLONE_LOG_SYSTEMD, RCLONE_DUMP_*).
-var scrubbedEnvPrefixes = []string{"RCLONE_LOG_", "RCLONE_DUMP_"}
+// rcloneEnvPrefix marks the variables rclone reads; rcloneConfigEnvPrefix is the
+// allowed config family (a non-empty remainder is required).
+const (
+	rcloneEnvPrefix       = "RCLONE_"
+	rcloneConfigEnvPrefix = "RCLONE_CONFIG_"
+)
 
-// childEnv returns environ without the variables that alter rclone's logging.
-// Everything else (credentials, RCLONE_CONFIG_*, backend options) passes through.
+// childEnv returns environ with every RCLONE_* variable removed except the
+// allowlist above. Names compare case-insensitively: Windows environment names
+// are case-insensitive, and elsewhere a differently-cased name is not one rclone
+// reads, so dropping it is harmless.
 func childEnv(environ []string) []string {
 	out := make([]string, 0, len(environ))
 	for _, kv := range environ {
 		name, _, _ := strings.Cut(kv, "=")
-		if _, drop := scrubbedEnvNames[name]; drop {
-			continue
-		}
-		dropped := false
-		for _, prefix := range scrubbedEnvPrefixes {
-			if strings.HasPrefix(name, prefix) {
-				dropped = true
-				break
-			}
-		}
-		if !dropped {
+		if allowedInChildEnv(strings.ToUpper(name)) {
 			out = append(out, kv)
 		}
 	}
 	return out
+}
+
+func allowedInChildEnv(upperName string) bool {
+	if !strings.HasPrefix(upperName, rcloneEnvPrefix) {
+		return true
+	}
+	if _, ok := allowedRcloneEnv[upperName]; ok {
+		return true
+	}
+	return strings.HasPrefix(upperName, rcloneConfigEnvPrefix) && len(upperName) > len(rcloneConfigEnvPrefix)
 }

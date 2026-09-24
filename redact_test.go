@@ -331,24 +331,42 @@ func TestRedactMasksOverlappingNeedles(t *testing.T) {
 	}
 }
 
-// TestChildEnvScrubsLogging: rclone reads its log grammar from RCLONE_* variables
-// that argv flags cannot override (measured: RCLONE_USE_JSON_LOG and
-// RCLONE_LOG_FORMAT=json still emit JSON with --use-json-log=false; RCLONE_VERBOSE
-// makes --log-level fatal). The child environment drops every such variable, and
-// RCLONE_DUMP (which logs request headers), and keeps everything else.
-func TestChildEnvScrubsLogging(t *testing.T) {
+// TestChildEnvDeniesRcloneByDefault: rclone reads EVERY global flag from
+// RCLONE_<FLAG>, and several change the data path or output (measured:
+// RCLONE_PROGRESS writes stats into Get's stdout and defeats Put's conflict
+// probe; RCLONE_DRY_RUN and RCLONE_INTERACTIVE make Put a silent no-op; the log
+// family changes the grammar redaction relies on). So every RCLONE_* variable is
+// dropped except an explicit allowlist — config location/decryption, env-defined
+// remotes (RCLONE_CONFIG_<REMOTE>_*), and transport tuning. Names compare
+// case-insensitively (Windows environment names are). Non-RCLONE variables pass.
+func TestChildEnvDeniesRcloneByDefault(t *testing.T) {
 	t.Parallel()
-	in := []string{
-		"PATH=/bin", "HOME=/h", "RCLONE_DISABLE=ListR", "RCLONE_CONFIG_PASS=keep", "RCLONE_S3_REGION=us",
-		"RCLONE_VERBOSE=2", "RCLONE_QUIET=true", "RCLONE_LOG_LEVEL=DEBUG", "RCLONE_LOG_FORMAT=json",
-		"RCLONE_USE_JSON_LOG=true", "RCLONE_LOG_FILE=/tmp/l", "RCLONE_LOG_FILE_MAX_SIZE=1M", "RCLONE_SYSLOG=true",
-		"RCLONE_SYSLOG_FACILITY=USER", "RCLONE_LOG_SYSTEMD=true", "RCLONE_STATS_LOG_LEVEL=NOTICE", "RCLONE_DUMP=headers",
-		"RCLONE_DUMP_HEADERS=true", "RCLONE_DUMP_BODIES=true", "RCLONE_DUMP_AUTH=true",
+	kept := []string{
+		"PATH=/bin", "HOME=/h", "HTTPS_PROXY=http://p:3128", "http_proxy=http://p", "AWS_ACCESS_KEY_ID=A",
+		"GOOGLE_APPLICATION_CREDENTIALS=/c.json", "_RCLONE_CONFIG_KEY_FILE=/k", "NOT_RCLONE_PROGRESS=1", "=C:=C:\\x", "RCLONE",
+		"RCLONE_CONFIG=/etc/rclone.conf", "RCLONE_CONFIG_PASS=p", "RCLONE_CONFIG_DIR=/etc",
+		"RCLONE_CONFIG_MYS3_TYPE=s3", "RCLONE_CONFIG_MYS3_ACCESS_KEY_ID=A", "rclone_config_win_type=local",
+		"RCLONE_PASSWORD_COMMAND=pass rclone", "RCLONE_ASK_PASSWORD=false",
+		"RCLONE_CONTIMEOUT=10s", "RCLONE_TIMEOUT=1m", "RCLONE_EXPECT_CONTINUE_TIMEOUT=1s",
+		"RCLONE_RETRIES=5", "RCLONE_RETRIES_SLEEP=1s", "RCLONE_LOW_LEVEL_RETRIES=20",
+		"RCLONE_CA_CERT=/ca.pem", "RCLONE_CLIENT_CERT=/c.pem", "RCLONE_CLIENT_KEY=/k.pem", "RCLONE_CLIENT_PASS=x",
+		"RCLONE_NO_CHECK_CERTIFICATE=true", "RCLONE_BWLIMIT=10M", "RCLONE_BWLIMIT_FILE=1M",
+		"RCLONE_TPSLIMIT=10", "RCLONE_TPSLIMIT_BURST=2", "RCLONE_USER_AGENT=ua", "RCLONE_BIND=0.0.0.0",
+		"RCLONE_DISABLE_HTTP2=true", "RCLONE_DISABLE_HTTP_KEEP_ALIVES=true", "RCLONE_DSCP=AF21",
 	}
-	got := childEnv(in)
-	want := []string{"PATH=/bin", "HOME=/h", "RCLONE_DISABLE=ListR", "RCLONE_CONFIG_PASS=keep", "RCLONE_S3_REGION=us"}
-	if strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("childEnv =\n  %v\nwant\n  %v", got, want)
+	dropped := []string{
+		"RCLONE_PROGRESS=true", "RCLONE_PROGRESS_TERMINAL_TITLE=true", "RCLONE_DRY_RUN=true", "RCLONE_INTERACTIVE=true",
+		"RCLONE_RC=true", "RCLONE_RC_ADDR=:5572", "RCLONE_MAX_DELETE=0", "RCLONE_DISABLE=ListR",
+		"RCLONE_HEADER=X-A: b", "RCLONE_HEADER_UPLOAD=X: y", "RCLONE_METADATA_SET=a=b", "RCLONE_S3_REGION=us",
+		"RCLONE_S3_VERSION_AT=2020-01-01", "RCLONE_LOCAL_ENCODING=None", "RCLONE_CONFIGX=1", "RCLONE_CONFIG_=1",
+		"RCLONE_VERBOSE=2", "RCLONE_QUIET=true", "RCLONE_LOG_LEVEL=DEBUG", "RCLONE_LOG_FORMAT=json",
+		"RCLONE_USE_JSON_LOG=true", "RCLONE_LOG_FILE=/tmp/l", "RCLONE_SYSLOG=true", "RCLONE_STATS_LOG_LEVEL=NOTICE",
+		"RCLONE_DUMP=headers", "RCLONE_DUMP_HEADERS=true", "RCLONE_TEMP_DIR=/t", "RCLONE_=1",
+		"Rclone_Progress=true", "rclone_dry_run=true", "RcLoNe_InTeRaCtIvE=true",
+	}
+	got := childEnv(append(append([]string(nil), kept...), dropped...))
+	if strings.Join(got, "|") != strings.Join(kept, "|") {
+		t.Fatalf("childEnv =\n  %v\nwant\n  %v", got, kept)
 	}
 }
 

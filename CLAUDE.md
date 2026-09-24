@@ -33,8 +33,12 @@ thin, security-hardened exec adapter — nothing more.
   cut remnant). Parameter values come from `parseConnectionString`, a port of rclone's
   `fspath.Parse` — keep it identical to rclone's grammar. Never surface stderr (or stdout)
   through any other path, and never CLASSIFY on stderr: not-found is exit 3/4 only.
-- **The child environment drops rclone's logging variables** (`childEnv`), so stderr stays in
-  the text grammar the redactor assumes. Do not remove it or add argv log flags instead.
+- **The rclone child environment is DENY BY DEFAULT** (`childEnv`): every `RCLONE_*` variable is
+  dropped except the allowlist in runner.go (config/env-defined remotes, config decryption,
+  transport tuning). Inherited `RCLONE_<FLAG>` variables otherwise corrupt the data path
+  (PROGRESS, DRY_RUN, INTERACTIVE) or the stderr grammar the redactor assumes. Only add an entry
+  after checking it is neutral to what is read or written, the output format, interactivity and
+  dry-run; never add argv log flags instead.
 
 ## Code rules
 
