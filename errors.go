@@ -35,11 +35,14 @@ func (e *PersistencePathError) Unwrap() error { return e.cause }
 //     credentials). The caller passes only non-secret subflags.
 //   - ExitCode   — the process exit status; -1 for a start failure or a signal kill.
 //   - Stderr     — a bounded tail (~4 KiB) of the process's stderr, REDACTED before
-//     capture: rclone echoes the remote it was given, inline ":backend,key=value:"
+//     it is kept: rclone echoes the remote it was given, inline ":backend,key=value:"
 //     credentials included, so the inline spec is rewritten to
 //     ":backend,<redacted>:" and every parameter value and the --config path to
-//     "<redacted>" (including a secret cut by the tail bound). A named remote's
-//     credentials live in the config file, which rclone does not echo.
+//     "<redacted>" in their verbatim, unquoted and Go-escaped spellings (a secret
+//     cut by the tail bound leaves no fragment). Transformed spellings (URL-encoded
+//     and the like) are not matched. A named remote's credentials live in the
+//     config file, which rclone does not echo. Stderr is diagnostic only: it is
+//     never used to classify the failure.
 //
 // The config path, inline remote parameters, and every positional are excluded by
 // construction, so an RcloneError is safe to log. Credentials supplied any other

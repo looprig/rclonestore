@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRedactorApply pins what redaction removes from captured rclone stderr: the
@@ -78,6 +79,15 @@ func TestRedactorApply(t *testing.T) {
 			in:      "echo KEYTAILSECRET",
 			want:    "echo <redacted>",
 			secrets: []string{"TAIL", "SECRET"},
+		},
+		{
+			// Defence in depth: the raw spelling (doubled quotes intact), alone and
+			// Go-escaped, is itself a needle — its content is not the unquoted value.
+			name:    "raw quoted spelling echoed alone, verbatim and Go-escaped",
+			remote:  `:local,a='IT''SX',b="DQ""RAW":/d`,
+			in:      `raw 'IT''SX' and "DQ""RAW" esc ` + strconv.Quote(`"DQ""RAW"`),
+			want:    `raw <redacted> and <redacted> esc "<redacted>"`,
+			secrets: []string{"IT", "SX", "DQ", "RAW"},
 		},
 		{
 			name:    "a bare flag parameter carries no value",
@@ -246,5 +256,138 @@ func TestNewProbeErrorRedactsInlineSecrets(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), ":s3,<redacted>:bkt") {
 		t.Fatalf("ProbeError lost the redacted remote form: %q", err.Error())
+	}
+}
+
+// TestRunnerOneByteTruncation: a capture that lost exactly ONE byte from its
+// start must still be treated as truncated, or a secret whose first byte was cut
+// survives minus that byte.
+func TestRunnerOneByteTruncation(t *testing.T) {
+	t.Parallel()
+	const secret = "QZXJWKVQZXJWKVQZXJWKV"
+	parsed, err := parseRemote(":s3,secret_access_key=" + secret + ":bkt")
+	if err != nil {
+		t.Fatalf("parseRemote: %v", err)
+	}
+	red := newRedactor(parsed, "")
+	dir := t.TempDir()
+	capacity := stderrTailBytes + red.margin()
+	// capacity+1 bytes, so only secret[0] is lost. Whole copies at the end make
+	// redaction SHRINK the output by more than margin, so the final length bound
+	// alone cannot hide an unmarked remnant at the start.
+	copies := strings.Repeat(" "+secret, red.margin()/(len(secret)-len(redactedMark))+2)
+	stderr := secret + strings.Repeat(".", capacity+1-len(secret)-len(copies)) + copies
+	stderrPath := filepath.Join(dir, "stderr")
+	if err := os.WriteFile(stderrPath, []byte(stderr), 0o600); err != nil {
+		t.Fatalf("write stderr: %v", err)
+	}
+	bin := writeFakeRclone(t, dir, fakeSpec{argvPath: filepath.Join(dir, "argv"), stderrPath: stderrPath, exitCode: 5})
+	runErr := (&runner{binary: bin, redact: red}).run(context.Background(), "lsf", nil, nil, nil, nil)
+	var re *RcloneError
+	if !errors.As(runErr, &re) {
+		t.Fatalf("run = %v, want *RcloneError", runErr)
+	}
+	if strings.ContainsAny(re.Stderr, "QZXJWKV") {
+		t.Fatalf("a fragment of the one-byte-cut secret survives: %q", re.Stderr[:min(len(re.Stderr), 60)])
+	}
+}
+
+// TestRedactTailExactBound pins the retained length at exactly limit for inputs
+// of limit+1 and limit+2 bytes, truncated or not.
+func TestRedactTailExactBound(t *testing.T) {
+	t.Parallel()
+	red := newRedactor(parsedRemote{}, "")
+	for _, extra := range []int{1, 2} {
+		for _, truncated := range []bool{false, true} {
+			in := strings.Repeat("a", 10) + strings.Repeat("b", extra)
+			got := red.redactTail([]byte(in), truncated, 10)
+			if len(got) != 10 {
+				t.Fatalf("extra=%d truncated=%v: len %d, want 10 (%q)", extra, truncated, len(got), got)
+			}
+		}
+	}
+}
+
+// TestRedactMasksOverlappingNeedles: the suffix of one value is the prefix of
+// another; masking the original bytes redacts the union, where sequential
+// replacement would leave the second value's tail.
+func TestRedactMasksOverlappingNeedles(t *testing.T) {
+	t.Parallel()
+	parsed, err := parseRemote(":s3,a=QQQXXX,b=XXXZZZ:bkt")
+	if err != nil {
+		t.Fatalf("parseRemote: %v", err)
+	}
+	got := newRedactor(parsed, "").apply("see QQQXXXZZZ end")
+	if got != "see <redacted> end" {
+		t.Fatalf("apply = %q", got)
+	}
+	// Overlapping occurrences of ONE needle: "ABAB" twice in "ABABAB".
+	parsed, err = parseRemote(":s3,a=ABAB:bkt")
+	if err != nil {
+		t.Fatalf("parseRemote: %v", err)
+	}
+	if got := newRedactor(parsed, "").apply("x ABABAB y"); got != "x <redacted> y" {
+		t.Fatalf("apply = %q", got)
+	}
+}
+
+// TestChildEnvScrubsLogging: rclone reads its log grammar from RCLONE_* variables
+// that argv flags cannot override (measured: RCLONE_USE_JSON_LOG and
+// RCLONE_LOG_FORMAT=json still emit JSON with --use-json-log=false; RCLONE_VERBOSE
+// makes --log-level fatal). The child environment drops every such variable, and
+// RCLONE_DUMP (which logs request headers), and keeps everything else.
+func TestChildEnvScrubsLogging(t *testing.T) {
+	t.Parallel()
+	in := []string{
+		"PATH=/bin", "HOME=/h", "RCLONE_DISABLE=ListR", "RCLONE_CONFIG_PASS=keep", "RCLONE_S3_REGION=us",
+		"RCLONE_VERBOSE=2", "RCLONE_QUIET=true", "RCLONE_LOG_LEVEL=DEBUG", "RCLONE_LOG_FORMAT=json",
+		"RCLONE_USE_JSON_LOG=true", "RCLONE_LOG_FILE=/tmp/l", "RCLONE_LOG_FILE_MAX_SIZE=1M", "RCLONE_SYSLOG=true",
+		"RCLONE_SYSLOG_FACILITY=USER", "RCLONE_LOG_SYSTEMD=true", "RCLONE_STATS_LOG_LEVEL=NOTICE", "RCLONE_DUMP=headers",
+		"RCLONE_DUMP_HEADERS=true", "RCLONE_DUMP_BODIES=true", "RCLONE_DUMP_AUTH=true",
+	}
+	got := childEnv(in)
+	want := []string{"PATH=/bin", "HOME=/h", "RCLONE_DISABLE=ListR", "RCLONE_CONFIG_PASS=keep", "RCLONE_S3_REGION=us"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("childEnv =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// TestProbeContextHasDefaultBound: with no Options.Timeout, New's reachability
+// probe is still bounded (rclone retries an unreachable endpoint for minutes);
+// with a Timeout the runner's own bound applies and the probe adds none.
+func TestProbeContextHasDefaultBound(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := probeContext(0, defaultProbeTimeout)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatalf("probe context has no deadline with Timeout 0")
+	}
+	if left := time.Until(deadline); left <= defaultProbeTimeout-time.Minute || left > defaultProbeTimeout {
+		t.Fatalf("probe deadline in %v, want about %v", left, defaultProbeTimeout)
+	}
+	ctx2, cancel2 := probeContext(time.Second, defaultProbeTimeout)
+	defer cancel2()
+	if _, ok := ctx2.Deadline(); ok {
+		t.Fatalf("probe context adds its own deadline when Timeout is set")
+	}
+}
+
+// TestProbeHonoursFallbackBound: with no per-call Timeout, a hung rclone probe is
+// killed at the fallback bound and reported as a *ProbeError carrying the
+// deadline, instead of hanging New.
+func TestProbeHonoursFallbackBound(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	bin := writeFakeRclone(t, dir, fakeSpec{argvPath: filepath.Join(dir, "argv"), sleepSecs: 30})
+	bs := newBlobStore(&runner{binary: bin}, "myremote", "", nil)
+	start := time.Now()
+	err := probe(bs, 300*time.Millisecond)
+	var pe *ProbeError
+	if !errors.As(err, &pe) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("probe = %v, want *ProbeError wrapping context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("probe ran %v past its 300ms fallback", elapsed)
 	}
 }

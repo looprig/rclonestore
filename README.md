@@ -52,11 +52,16 @@ accordingly (a hardcoded colon would break the connection-string form):
   with a colon, so the path is appended with a slash instead:
   `:local:/data` + `prefix/key` → `:local:/data/prefix/key`.
 
-The parser finds the spec-ending unquoted colon. Parameter values containing colons or commas
-must use rclone's single- or double-quoted form; doubling the active quote escapes it. For
-example, `:local,token='https://user:pass@host':/data` still has `/data` as its local path.
-Unterminated quoted values are rejected without echoing the credential-bearing remote.
-Colons after the spec delimiter belong to the path. An empty `Prefix` collapses cleanly.
+The connection string is parsed with a port of **rclone's own parser** (`fs/fspath` `Parse`), so
+rclonestore and rclone agree on every parameter value and on where the path starts. A value is
+quoted only if its **first** byte is `'` or `"` (a quote anywhere else is literal); inside a
+quoted value the quote is escaped by doubling it; an unquoted value ends at the first `,` or `:`.
+Values containing colons or commas must therefore be quoted: for example,
+`:local,token='https://user:pass@host':/data` has `/data` as its local path, while an unquoted
+`endpoint=http://h:9` ends the value at `http` and makes `//h:9…` the path, exactly as rclone
+reads it. Malformed strings (unterminated quotes, bad parameter names, text after a closing
+quote) are rejected without echoing the credential-bearing remote. An empty `Prefix` collapses
+cleanly.
 
 ### Local persistence paths
 
@@ -96,7 +101,8 @@ storage name (which is exactly what ≤ v0.4.x wrote, and never what v0.5.0 writ
 object). `List` fails closed the same way if one appears later, e.g. from a rolled-back binary,
 instead of silently omitting it. Move or delete the old root. The root must be dedicated to
 rclonestore: a foreign object spelled like a storage name is indistinguishable from legacy data
-and is refused too. **One-way:** ≤ v0.4.x does not understand a v0.5.0 root (its `Get` finds
+and is refused too, and a foreign file whose *name contains a newline* can forge a line of
+rclone's listing (a phantom key, or a legacy-shaped path and a refusal). **One-way:** ≤ v0.4.x does not understand a v0.5.0 root (its `Get` finds
 nothing and its `List` reports `…@blob` names), so never roll a root back.
 
 The scan is one recursive listing of the root at every `New` — the same cost as one `List` call.
@@ -107,7 +113,9 @@ the `*RcloneError`), never read as clean or as legacy.
 ### Startup probe
 
 `New` probes reachability with `rclone lsf --max-depth 0 -- <remote-root>`, bounded by
-`Timeout`. A benign not-found on the root (a fresh store whose root directory does not exist
+`Timeout` — or, when `Timeout` is zero, by a default of two minutes, because rclone retries an
+unreachable endpoint for minutes. The legacy-layout scan has no default bound (it lists the whole
+root); set `Timeout` to bound it and every later call. A benign not-found on the root (a fresh store whose root directory does not exist
 yet — first `Put` creates it) is treated as reachable-but-empty and succeeds, matching
 `List`'s semantics. Any other failure (unknown remote, auth, network) is a `*ProbeError`
 wrapping the credential-safe `*RcloneError`. The legacy-layout scan described above runs only
@@ -127,9 +135,12 @@ something other than rclonestore wrote into the root) returns the concatenation 
 directory's files, because `rclone cat` of a directory does so. Confirming every read would
 double `Get`'s cost, so it is not done; keep the root dedicated.
 
+**Not-found is rclone's exit code 3 or 4, and nothing else.** Stderr text is never classified:
 rclone prints `Config file "…" not found - using defaults` on every call when no config file
-exists. That line is never taken as an object not-found; only exit codes 3/4 or a "not found" on
-any other stderr line are.
+exists, and a misconfigured endpoint can answer `404 Not Found`; reading either as "absent" would
+make `Get` report a missing blob and `Put` upload over an object it failed to probe. A backend
+that reported not-found some other way would fail loudly instead (both `:local:` and S3 use
+3/4).
 
 ## Security posture
 
@@ -142,12 +153,21 @@ any other stderr line are.
   path only. Errors carry only the rclone subcommand, safe subflags, the exit code, and a
   bounded (~4 KiB) tail of stderr; never the config path, the remote, or any positional.
   **rclone's own diagnostics do echo the remote**, inline `key=value` credentials included, so
-  the stderr tail is **redacted before capture**: `:s3,access_key_id=…,secret_access_key=…:bkt`
-  becomes `:s3,<redacted>:bkt`, every inline parameter value and the config path become
-  `<redacted>` wherever they appear (a value that is also ordinary text is over-redacted), and a
-  secret cut by the tail bound is dropped. Credentials passed through `RCLONE_*` environment
-  variables are invisible to rclonestore and are not redacted — prefer a named remote with its
-  secrets in the config file.
+  the stderr tail is **redacted before it is kept**: `:s3,access_key_id=…,secret_access_key=…:bkt`
+  becomes `:s3,<redacted>:bkt`, and every inline parameter value and the config path become
+  `<redacted>` wherever they appear (a value that is also ordinary text is over-redacted). The
+  masking marks the original bytes, so a secret cut by the tail bound leaves no fragment.
+  - **Exact spellings only.** Redaction matches a value verbatim, as rclone unquotes it, and
+    Go-escaped (`%q`). A value rclone or an SDK *transforms* — URL-encoded (a SAS or endpoint
+    userinfo inside a request URL), reordered query parameters, case-folded — is not matched.
+  - **Log grammar is pinned** by removing rclone's logging variables (`RCLONE_VERBOSE`,
+    `RCLONE_QUIET`, `RCLONE_USE_JSON_LOG`, `RCLONE_LOG_*`, `RCLONE_SYSLOG*`, `RCLONE_DUMP*`, …)
+    from the child's environment; argv flags cannot override them. All other variables pass
+    through.
+  - **Not covered:** credentials supplied through `RCLONE_*` backend variables are invisible to
+    rclonestore and are not redacted; and an inline connection string is in rclone's **argv**,
+    so any local user who can list processes (`ps`, `/proc/<pid>/cmdline`) can read it while a
+    call runs. **Prefer a named remote with its secrets in the config file.**
   `OptionsError` names the offending field and rule but never the offending value (a
   connection-string `Remote` can embed secrets), and `ProbeError` does not carry the remote.
 - **Never links librclone / cgo** — rclone is driven as a subprocess only.

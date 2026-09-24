@@ -29,7 +29,12 @@ thin, security-hardened exec adapter — nothing more.
   "…"` line, `-vv`). Every captured stderr byte therefore goes through `redactor` (redact.go)
   before it reaches an `RcloneError`: the inline spec becomes `:backend,<redacted>:`, every
   parameter value and the config path become `<redacted>`, and a secret cut by the tail bound is
-  dropped. Never surface stderr (or stdout) through any other path.
+  dropped. Masking marks the ORIGINAL bytes (never sequential replacement, which can lengthen a
+  cut remnant). Parameter values come from `parseConnectionString`, a port of rclone's
+  `fspath.Parse` — keep it identical to rclone's grammar. Never surface stderr (or stdout)
+  through any other path, and never CLASSIFY on stderr: not-found is exit 3/4 only.
+- **The child environment drops rclone's logging variables** (`childEnv`), so stderr stays in
+  the text grammar the redactor assumes. Do not remove it or add argv log flags instead.
 
 ## Code rules
 

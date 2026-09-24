@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -55,6 +57,7 @@ func (r *runner) run(ctx context.Context, subcommand string, subflags, positiona
 	// can be read as a flag, and ctx bounds and kills the process. The permission
 	// to run rclone at all is the caller's; this is why the exec is safe.
 	cmd := exec.CommandContext(ctx, r.binary, args...) // #nosec G204 -- argv-only (no shell), ctx-bounded, `--` before positionals; see CLAUDE.md
+	cmd.Env = childEnv(os.Environ())
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	// Capture margin extra bytes so a secret cut by the bound can be dropped after
@@ -143,3 +146,48 @@ func (w *tailWriter) tail() []byte { return w.buf }
 
 // truncated reports whether bytes were discarded from the front of the tail.
 func (w *tailWriter) truncated() bool { return w.total > len(w.buf) }
+
+// scrubbedEnvNames are the RCLONE_* variables that change rclone's log grammar,
+// level or destination. The child never inherits them, so its stderr is always
+// the default NOTICE-level text log the redactor's needles describe. argv flags
+// cannot do this (measured, rclone v1.71.1): with --use-json-log=false,
+// RCLONE_USE_JSON_LOG=true and RCLONE_LOG_FORMAT=json still emit JSON (which
+// escapes a secret into a spelling no needle matches), RCLONE_LOG_LEVEL=DEBUG
+// still wins, and RCLONE_VERBOSE/RCLONE_QUIET make --log-level fatal. The
+// RCLONE_DUMP family is dropped too: it logs request headers and bodies.
+var scrubbedEnvNames = map[string]struct{}{
+	"RCLONE_VERBOSE":         {},
+	"RCLONE_QUIET":           {},
+	"RCLONE_USE_JSON_LOG":    {},
+	"RCLONE_SYSLOG":          {},
+	"RCLONE_SYSLOG_FACILITY": {},
+	"RCLONE_STATS_LOG_LEVEL": {},
+	"RCLONE_DUMP":            {},
+}
+
+// scrubbedEnvPrefixes cover the variable families (RCLONE_LOG_LEVEL,
+// RCLONE_LOG_FORMAT, RCLONE_LOG_FILE*, RCLONE_LOG_SYSTEMD, RCLONE_DUMP_*).
+var scrubbedEnvPrefixes = []string{"RCLONE_LOG_", "RCLONE_DUMP_"}
+
+// childEnv returns environ without the variables that alter rclone's logging.
+// Everything else (credentials, RCLONE_CONFIG_*, backend options) passes through.
+func childEnv(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if _, drop := scrubbedEnvNames[name]; drop {
+			continue
+		}
+		dropped := false
+		for _, prefix := range scrubbedEnvPrefixes {
+			if strings.HasPrefix(name, prefix) {
+				dropped = true
+				break
+			}
+		}
+		if !dropped {
+			out = append(out, kv)
+		}
+	}
+	return out
+}

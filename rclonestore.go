@@ -32,6 +32,7 @@ type parsedRemote struct {
 	backend          string
 	spec             string // text between the leading ':' and the spec-ending ':' (backend plus any ",params")
 	path             string
+	params           []remoteParam
 }
 
 // Options configures a rclonestore Store. Only Remote is required. No field is
@@ -118,7 +119,7 @@ func New(opts Options) (*Store, error) {
 	}
 	bs := newBlobStore(r, opts.Remote, opts.Prefix, paths)
 
-	if err := probe(bs); err != nil {
+	if err := probe(bs, defaultProbeTimeout); err != nil {
 		return nil, err
 	}
 	if err := refuseLegacyLayout(context.Background(), bs); err != nil {
@@ -227,61 +228,198 @@ func canonicalizePersistencePath(path string) (string, error) {
 // Store uniformly with stores that do hold resources.
 func (s *Store) Close() error { return nil }
 
+// defaultProbeTimeout bounds New's reachability probe when Options.Timeout is
+// zero. rclone retries an unreachable endpoint (low-level retries times
+// --retries), which was measured running for minutes, so an unbounded probe could
+// hang New indefinitely. The probe lists one directory level, so two minutes are
+// generous for any reachable remote. The legacy-layout scan is NOT given a default
+// bound: it lists the whole root, and on a large bucket it legitimately takes as
+// long as it takes; set Options.Timeout to bound it.
+const defaultProbeTimeout = 2 * time.Minute
+
+// probeContext is the probe's context: bounded by fallback when no per-call
+// Timeout is configured, otherwise left to the runner's own bound.
+func probeContext(timeout, fallback time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), fallback)
+}
+
 // probe verifies the remote is reachable by listing its root at depth 0. A
 // not-found (the root directory does not exist yet on a fresh store) is NOT a
 // failure — it means rclone reached the backend and found the root empty/absent,
 // which first Put will create — so it maps to nil, matching List's semantics. Any
 // other failure (unknown remote, auth, network) is wrapped in a *ProbeError. The
 // probe is bounded by the runner's timeout (opts.Timeout).
-func probe(bs *blobStore) error {
+// fallback bounds the probe when the runner has no per-call timeout (New passes
+// defaultProbeTimeout).
+func probe(bs *blobStore, fallback time.Duration) error {
+	ctx, cancel := probeContext(bs.r.timeout, fallback)
+	defer cancel()
 	var out bytes.Buffer
-	err := bs.r.run(context.Background(), "lsf", []string{"--max-depth", "0"}, []string{bs.listRoot()}, nil, &out)
+	err := bs.r.run(ctx, "lsf", []string{"--max-depth", "0"}, []string{bs.listRoot()}, nil, &out)
 	if err == nil || isNotFound(err) {
 		return nil
 	}
 	return &ProbeError{cause: err}
 }
 
-// parseRemote accepts a named remote or scans an inline connection string. The
-// scan stops only at an unquoted colon; single- and double-quoted parameter values
-// may contain colons/commas and escape their quote by doubling it. Errors never
-// carry the remote value because backend parameters can contain credentials.
+// parseRemote accepts a named remote or parses an inline connection string with
+// parseConnectionString. Errors never carry the remote value because backend
+// parameters can contain credentials.
 func parseRemote(remote string) (parsedRemote, error) {
 	if remote == "" {
 		return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "required"}
 	}
 	if strings.HasPrefix(remote, ":") {
-		quote := byte(0)
-		for i := 1; i < len(remote); i++ {
-			ch := remote[i]
-			if quote != 0 {
-				if ch == quote {
-					if i+1 < len(remote) && remote[i+1] == quote {
-						i++
-						continue
-					}
-					quote = 0
-				}
-				continue
-			}
-			switch ch {
-			case '\'', '"':
-				quote = ch
-			case ':':
-				backendSpec := remote[1:i]
-				backend, _, _ := strings.Cut(backendSpec, ",")
-				if !validBackendName(backend) {
-					return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "malformed connection string (want :backend:[path])"}
-				}
-				return parsedRemote{connectionString: true, backend: backend, spec: backendSpec, path: remote[i+1:]}, nil
-			}
-		}
-		return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "malformed connection string (want balanced quoted parameters and :backend:[path])"}
+		return parseConnectionString(remote)
 	}
 	if !namedRemoteRe.MatchString(remote) {
 		return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "not a named remote ([A-Za-z0-9_-]) or a :backend: connection string"}
 	}
 	return parsedRemote{}, nil
+}
+
+// remoteParam is one ",name[=value]" parameter of an inline connection string.
+// raw is the value exactly as spelled (quotes and doubled quotes included);
+// value is what rclone uses (quotes stripped, doubled quotes collapsed). A bare
+// "name" parameter (rclone sets it to "true") has neither.
+type remoteParam struct {
+	name  string
+	raw   string
+	value string
+}
+
+// parseConnectionString is a port of rclone's own connection-string state machine
+// (fs/fspath/path.go Parse, rclone v1.71.1), so rclonestore agrees with rclone on
+// where every parameter value and the path begin and end — the redactor's
+// needles and StoragePaths both depend on it:
+//
+//   - ":backend" then ',' (parameters follow) or ':' (the path follows);
+//   - a parameter name is [0-9A-Za-z_.]+, ended by '=', ',' or ':';
+//   - a value is quoted ONLY if its first byte is ' or "; a quote anywhere else
+//     is literal. An unquoted value ends at the first ',' or ':';
+//   - inside a quoted value the active quote is escaped by doubling it; after the
+//     closing quote only ',' ':' or that quote (the doubled form) may follow;
+//   - the first ':' that ends a value, a bare parameter or the backend ends the
+//     spec; everything after it is the path.
+//
+// The backend is further held to lowercase alphanumerics (stricter than rclone).
+func parseConnectionString(remote string) (parsedRemote, error) {
+	const (
+		stateBackend = iota
+		stateParam
+		stateValue
+		stateQuotedValue
+		stateAfterQuote
+	)
+	malformed := func(rule string) (parsedRemote, error) {
+		return parsedRemote{}, &OptionsError{Field: "Remote", Rule: "malformed connection string: " + rule}
+	}
+	p := parsedRemote{connectionString: true}
+	finish := func(i int) (parsedRemote, error) {
+		p.spec = remote[1:i]
+		p.path = remote[i+1:]
+		return p, nil
+	}
+	var (
+		state      = stateBackend
+		prev       = 1 // start of the token being scanned
+		valueStart int // start of the current value's raw spelling
+		name       string
+		quote      byte
+		doubled    bool
+	)
+	for i := 1; i < len(remote); i++ {
+		c := remote[i]
+		switch state {
+		case stateBackend:
+			// rclone refuses a '/' or '\\' before the first ':' or ','; validBackendName
+			// (lowercase alphanumeric only) refuses the same strings.
+			switch c {
+			case ':', ',':
+				p.backend = remote[1:i]
+				if !validBackendName(p.backend) {
+					return malformed("want :backend:[path] with a lowercase alphanumeric backend")
+				}
+				prev = i + 1
+				if c == ':' {
+					return finish(i)
+				}
+				state = stateParam
+			}
+		case stateParam:
+			switch {
+			case c == ':' || c == ',' || c == '=':
+				name = remote[prev:i]
+				if name == "" {
+					return malformed("empty parameter name")
+				}
+				prev = i + 1
+				if c == '=' {
+					valueStart = prev
+					state = stateValue
+					continue
+				}
+				p.params = append(p.params, remoteParam{name: name})
+				if c == ':' {
+					return finish(i)
+				}
+			case !isConfigParamByte(c):
+				return malformed("parameter names may only contain 0-9, A-Z, a-z, '_' and '.'")
+			}
+		case stateValue:
+			switch {
+			case (c == '\'' || c == '"') && i == prev:
+				quote = c
+				doubled = false
+				prev = i + 1
+				state = stateQuotedValue
+			case c == ':' || c == ',':
+				p.params = append(p.params, remoteParam{name: name, raw: remote[valueStart:i], value: remote[prev:i]})
+				prev = i + 1
+				if c == ':' {
+					return finish(i)
+				}
+				state = stateParam
+			}
+		case stateQuotedValue:
+			if c == quote {
+				state = stateAfterQuote
+			}
+		case stateAfterQuote:
+			switch {
+			case c == ':' || c == ',':
+				value := remote[prev : i-1]
+				if doubled {
+					value = strings.ReplaceAll(value, string([]byte{quote, quote}), string(quote))
+				}
+				p.params = append(p.params, remoteParam{name: name, raw: remote[valueStart:i], value: value})
+				prev = i + 1
+				if c == ':' {
+					return finish(i)
+				}
+				state = stateParam
+			case c == quote:
+				doubled = true
+				state = stateQuotedValue
+			default:
+				return malformed("want ':' or ',' or a doubled quote after a closing quote")
+			}
+		}
+	}
+	switch state {
+	case stateQuotedValue:
+		return malformed("unterminated quoted value")
+	default:
+		return malformed("want balanced quoted parameters and :backend:[path]")
+	}
+}
+
+// isConfigParamByte is rclone's isConfigParam: [0-9A-Za-z_.].
+func isConfigParamByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.'
 }
 
 func validBackendName(backend string) bool {

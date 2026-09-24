@@ -491,9 +491,12 @@ func TestBlobsGet(t *testing.T) {
 			wantErr: func(t *testing.T, err error) { requireBlobNotFound(t, err, key) },
 		},
 		{
-			name:    "absent via stderr marker under non-standard exit code",
+			// Not-found is rclone's documented exits 3/4 only. Stderr text is never
+			// classified: an HTTP "404 Not Found" from a misconfigured endpoint, or
+			// any other "not found" wording, stays an error and never reads as absence.
+			name:    "a stderr \"not found\" under a non-3/4 exit is an error, never absence",
 			spec:    blobFakeSpec{catExit: 1, catErr: "Failed to open: object not found\n"},
-			wantErr: func(t *testing.T, err error) { requireBlobNotFound(t, err, key) },
+			wantErr: func(t *testing.T, err error) { requireRcloneExit(t, err, 1) },
 		},
 		{
 			// rclone prints this notice on every call when no config file exists
@@ -505,10 +508,10 @@ func TestBlobsGet(t *testing.T) {
 			wantErr: func(t *testing.T, err error) { requireRcloneExit(t, err, 1) },
 		},
 		{
-			name: "a real not-found beside the missing-config notice is still not-found",
+			name: "404 Not Found text beside the missing-config notice is an error",
 			spec: blobFakeSpec{catExit: 1, catErr: "NOTICE: Config file \"/c\" not found - using defaults\n" +
-				"ERROR : Failed to cat: object not found\n"},
-			wantErr: func(t *testing.T, err error) { requireBlobNotFound(t, err, key) },
+				"ERROR : Failed to cat: 404 Not Found\n"},
+			wantErr: func(t *testing.T, err error) { requireRcloneExit(t, err, 1) },
 		},
 		{
 			name:    "genuine error propagates as RcloneError",
@@ -576,9 +579,14 @@ func TestBlobsDelete(t *testing.T) {
 			wantErr: func(t *testing.T, err error) { requireNoErr(t, err) },
 		},
 		{
-			name:    "absent via stderr marker is idempotent nil",
-			spec:    blobFakeSpec{delExit: 1, delErr: "Couldn't delete: object not found\n"},
+			name:    "absent via exit 3 is idempotent nil",
+			spec:    blobFakeSpec{delExit: exitDirNotFound, delErr: "directory not found\n"},
 			wantErr: func(t *testing.T, err error) { requireNoErr(t, err) },
+		},
+		{
+			name:    "a stderr \"not found\" under a non-3/4 exit is an error, not success",
+			spec:    blobFakeSpec{delExit: 1, delErr: "Couldn't delete: object not found\n"},
+			wantErr: func(t *testing.T, err error) { requireRcloneExit(t, err, 1) },
 		},
 		{
 			name:    "genuine error propagates",
@@ -1009,4 +1017,51 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestBlobsDeepKeyLeafProbe drives the exact-leaf probe on a key of 3+ segments:
+// the probed leaf is the LAST segment plus the suffix ("c@blob" for "a/b/c"), so a
+// present object conflicts or no-ops, and an empty object Gets as empty.
+func TestBlobsDeepKeyLeafProbe(t *testing.T) {
+	t.Parallel()
+	const key = "sessions/a/b/c"
+	const wantPath = "remote:pfx/sessions/a/b/c@blob"
+
+	t.Run("present different conflicts", func(t *testing.T) {
+		t.Parallel()
+		b, dir := newTestBlobStore(t, blobFakeSpec{lsfOut: "c@blob\n", catOut: []byte("original")})
+		requireBlobConflict(t, b.Put(context.Background(), key, bytes.NewReader([]byte("different"))), key)
+		if _, ran := argvOf(t, dir, "rcat"); ran {
+			t.Fatalf("rcat ran over a present object")
+		}
+		argv, _ := argvOf(t, dir, "lsf")
+		assertDashDashBeforePositional(t, argv, wantPath)
+	})
+	t.Run("present identical is a no-op", func(t *testing.T) {
+		t.Parallel()
+		b, dir := newTestBlobStore(t, blobFakeSpec{lsfOut: "c@blob\n", catOut: []byte("same")})
+		requireNoErr(t, b.Put(context.Background(), key, bytes.NewReader([]byte("same"))))
+		if _, ran := argvOf(t, dir, "rcat"); ran {
+			t.Fatalf("rcat ran over an identical object")
+		}
+	})
+	t.Run("an intermediate segment is not the leaf", func(t *testing.T) {
+		t.Parallel()
+		b, dir := newTestBlobStore(t, blobFakeSpec{lsfOut: "a@blob\n", catOut: []byte("x")})
+		requireNoErr(t, b.Put(context.Background(), key, bytes.NewReader([]byte("new"))))
+		if _, ran := argvOf(t, dir, "rcat"); !ran {
+			t.Fatalf("a non-leaf probe line was taken as present")
+		}
+	})
+	t.Run("empty object Gets as empty", func(t *testing.T) {
+		t.Parallel()
+		b, _ := newTestBlobStore(t, blobFakeSpec{catOut: []byte{}, lsfOut: "c@blob\n"})
+		rc, err := b.Get(context.Background(), key)
+		requireNoErr(t, err)
+		got, rerr := io.ReadAll(rc)
+		if rerr != nil || len(got) != 0 {
+			t.Fatalf("Get = %q, %v; want empty", got, rerr)
+		}
+		requireNoErr(t, rc.Close())
+	})
 }

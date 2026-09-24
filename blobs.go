@@ -15,18 +15,12 @@ import (
 // rclone's documented exit-code table (https://rclone.org/docs/#list-of-exit-codes)
 // distinguishes a missing directory from a missing file. Both mean "the object the
 // caller asked for is not there" for our purposes: an absent blob for Get/Delete,
-// an empty listing for List, a not-present object for Put's existence probe.
+// an empty listing for List, a not-present object for Put's existence probe. They
+// are the ONLY not-found signal (see isNotFound).
 const (
 	exitDirNotFound  = 3 // rclone: "directory not found"
 	exitFileNotFound = 4 // rclone: "object/file not found"
 )
-
-// notFoundMarker is the case-insensitive stderr substring used as a secondary
-// not-found signal, in case a remote surfaces a not-found through a different exit
-// code than 3/4 (some backends historically returned 1). Matching a stable phrase
-// rather than a full-string equality keeps the classifier robust to diagnostic
-// wording that varies by rclone version and backend.
-const notFoundMarker = "not found"
 
 // blobLeafSuffix is appended to every key to form its object's leaf name. The
 // storage grammar allows only [a-z0-9][a-z0-9_.-]* per segment, so '@' never
@@ -414,42 +408,21 @@ func joinPath(prefix, rest string) string {
 	return prefix + "/" + rest
 }
 
-// isNotFound reports whether err is a not-found from rclone. It classifies on the
-// runner's *RcloneError, primarily by exit code (3 directory-not-found, 4
-// file-not-found per rclone's documented table) and secondarily by a "not found"
-// stderr marker for remotes that surface not-found through another code — on any
-// stderr line except rclone's missing-config notice (isMissingConfigNotice). It never
-// inspects the remote or the positional path (RcloneError excludes them), so no
-// credential can leak through classification.
-//
-// ASSUMPTION (RC3 validates against real rclone across remotes): exit codes 3/4 are
-// the primary signal. If a backend reports a missing object with a different code
-// and non-"not found" wording, RC3's storetest conformance will surface it and the
-// marker set here is where the fix goes.
+// isNotFound reports whether err is a not-found from rclone: an *RcloneError
+// with rclone's documented exit code 3 (directory not found) or 4 (object/file
+// not found). Stderr is deliberately NOT consulted. A "not found" phrase in
+// stderr was once a secondary signal, but it misfires in the dangerous direction
+// — it turned auth, network and option failures into "absent" (rclone's
+// per-call `Config file "…" not found - using defaults` notice, an HTTP
+// "404 Not Found" from a misconfigured endpoint), which makes Get answer
+// BlobNotFoundError and Put upload over an object it failed to probe. Exits 3/4
+// carry not-found on both :local: and bucket remotes (storage conformance on
+// each), so a backend that reports not-found some other way fails loudly
+// instead. Classification therefore never sees redacted text either.
 func isNotFound(err error) bool {
 	var re *RcloneError
 	if !errors.As(err, &re) {
 		return false
 	}
-	if re.ExitCode == exitDirNotFound || re.ExitCode == exitFileNotFound {
-		return true
-	}
-	for _, line := range strings.Split(re.Stderr, "\n") {
-		if isMissingConfigNotice(line) {
-			continue
-		}
-		if strings.Contains(strings.ToLower(line), notFoundMarker) {
-			return true
-		}
-	}
-	return false
-}
-
-// isMissingConfigNotice reports rclone's per-invocation notice that no config
-// file exists (`NOTICE: Config file "<path>" not found - using defaults`). It is
-// printed on EVERY call when there is no rclone.conf — the norm with
-// connection-string remotes — and its "not found" is about the config file, not
-// the object, so it must never turn an auth or network failure into "absent".
-func isMissingConfigNotice(line string) bool {
-	return strings.Contains(line, "Config file ") && strings.Contains(line, "not found - using defaults")
+	return re.ExitCode == exitDirNotFound || re.ExitCode == exitFileNotFound
 }
