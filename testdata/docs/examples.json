@@ -37,7 +37,7 @@
       "versions": {
         "github.com/looprig/rclonestore": "source-workspace"
       },
-      "offlineCommand": "GOWORK=off go test -race ./...",
+      "offlineCommand": "GOWORK=off go test -race ./... -p=1 -parallel=1",
       "assertion": "A deterministic scripted rclone subprocess proves public option forwarding, immutable and idempotent blob puts, typed conflicts and missing-object errors, get/list/delete behavior, reader ownership, and idempotent Store.Close without a real remote.",
       "workflowPath": ".github/workflows/docs-examples.yml",
       "jobId": "docs-examples",

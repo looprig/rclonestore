@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-const offlineExamplesCommand = "GOWORK=off go test -race ./..."
+const offlineExamplesCommand = "GOWORK=off go test -race ./... -p=1 -parallel=1"
 
 type examplesManifest struct {
 	SchemaVersion int    `json:"schemaVersion"`
