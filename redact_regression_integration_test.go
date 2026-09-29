@@ -182,3 +182,15 @@ func TestEnvDefinedRemoteStillWorks(t *testing.T) {
 		t.Fatalf("object not written through the env-defined remote: %q, %v", data, err)
 	}
 }
+
+func TestInlineRemoteIgnoresConfigEnv(t *testing.T) {
+	requireRclone(t)
+	t.Setenv("RCLONE_CONFIG_:LOCAL_LINKS", "NOTABOOL")
+	s, err := New(Options{Remote: ":local:" + t.TempDir()})
+	if err != nil {
+		t.Fatalf("New(:local:): %v", err)
+	}
+	if err := s.Put(context.Background(), "a", strings.NewReader("safe")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+}

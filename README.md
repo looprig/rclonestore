@@ -59,6 +59,7 @@ persistent connection, so its `Close` is a documented no-op.
 | `Binary`           | rclone executable; default `"rclone"`, resolved via `exec.LookPath`. |
 | `ConfigPath`       | Optional `--config` path. Referenced by path only — never opened, parsed, copied, or logged (it may hold remote secrets). |
 | `Timeout`          | Optional bound on every rclone invocation (including the startup probe). Zero means each call is bounded only by the caller's context. |
+| `DisableListR`     | Pass `--disable ListR` to rclone when a provider has broken recursive listing. Defaults to false. |
 
 ### The two remote forms
 
@@ -174,7 +175,7 @@ the rclone child's environment except this allowlist** (names compared case-inse
 | Allowed | Why |
 |---|---|
 | `RCLONE_CONFIG` | config file path (`ConfigPath`, passed as `--config`, takes precedence) |
-| `RCLONE_CONFIG_*` | `RCLONE_CONFIG_PASS`, `RCLONE_CONFIG_DIR`, and **environment-defined remotes** `RCLONE_CONFIG_<REMOTE>_<OPTION>` |
+| `RCLONE_CONFIG_*` | `RCLONE_CONFIG_PASS`, `RCLONE_CONFIG_DIR`, and **environment-defined named remotes** `RCLONE_CONFIG_<REMOTE>_<OPTION>`; names containing `:` are dropped |
 | `RCLONE_PASSWORD_COMMAND`, `RCLONE_ASK_PASSWORD` | decrypting an encrypted config |
 | `RCLONE_CONTIMEOUT`, `RCLONE_TIMEOUT`, `RCLONE_EXPECT_CONTINUE_TIMEOUT` | timeouts |
 | `RCLONE_RETRIES`, `RCLONE_RETRIES_SLEEP`, `RCLONE_LOW_LEVEL_RETRIES` | retries |
@@ -184,10 +185,12 @@ the rclone child's environment except this allowlist** (names compared case-inse
 
 Everything else named `RCLONE_*` is dropped. That includes the logging, progress, dry-run and
 interactive flags, `RCLONE_RC*`, `RCLONE_HEADER*`, `RCLONE_METADATA_SET`, `RCLONE_DISABLE`, and
-**all backend options such as `RCLONE_S3_REGION`**. Put backend options in the connection string
+**all backend options such as `RCLONE_S3_REGION`**, including inline-remote names such as
+`RCLONE_CONFIG_:S3_VERSION_AT`. Put backend options in the connection string
 or the config file (or define the remote with `RCLONE_CONFIG_<REMOTE>_*`). Variables not named
 `RCLONE_*`, such as `HTTPS_PROXY`, `HOME`, `PATH` and cloud SDK credentials like `AWS_*`, pass
-through unchanged.
+through unchanged. If a provider needs recursive listing disabled, set `Options.DisableListR`;
+the inherited `RCLONE_DISABLE` variable remains dropped.
 
 ## Known limits
 

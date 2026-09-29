@@ -26,10 +26,11 @@ const stderrTailBytes = 4 << 10 // 4 KiB
 // of which subflags are safe to surface belong to the caller (the Blobs adapter),
 // not here.
 type runner struct {
-	binary     string        // path to the rclone binary (resolved by the caller)
-	configPath string        // optional --config path; referenced only, never read or logged here
-	timeout    time.Duration // optional per-call bound; 0 relies on the caller's ctx alone
-	redact     redactor      // removes inline-remote credentials and the config path from captured stderr
+	binary       string        // path to the rclone binary (resolved by the caller)
+	configPath   string        // optional --config path; referenced only, never read or logged here
+	timeout      time.Duration // optional per-call bound; 0 relies on the caller's ctx alone
+	disableListR bool          // pass --disable ListR for broken recursive listing providers
+	redact       redactor      // removes inline-remote credentials and the config path from captured stderr
 }
 
 // run executes:
@@ -50,7 +51,7 @@ func (r *runner) run(ctx context.Context, subcommand string, subflags, positiona
 		defer cancel()
 	}
 
-	args := buildArgs(r.configPath, subcommand, subflags, positionals)
+	args := buildArgs(r.configPath, r.disableListR, subcommand, subflags, positionals)
 
 	// argv exec only — no shell string is ever constructed. Every element is a
 	// discrete argument, `--` terminates flags before the positionals so no key
@@ -87,10 +88,13 @@ func (r *runner) run(ctx context.Context, subcommand string, subflags, positiona
 // the subcommand, then the subflags, then `--` inserted exactly once immediately
 // before the positional path arguments so no positional beginning with '-' is
 // parsed as a flag.
-func buildArgs(configPath, subcommand string, subflags, positionals []string) []string {
-	args := make([]string, 0, 3+len(subflags)+len(positionals))
+func buildArgs(configPath string, disableListR bool, subcommand string, subflags, positionals []string) []string {
+	args := make([]string, 0, 5+len(subflags)+len(positionals))
 	if configPath != "" {
 		args = append(args, "--config", configPath)
+	}
+	if disableListR {
+		args = append(args, "--disable", "ListR")
 	}
 	args = append(args, subcommand)
 	args = append(args, subflags...)
@@ -160,7 +164,7 @@ func (w *tailWriter) truncated() bool { return w.total > len(w.buf) }
 // or written, the output format, interactivity and dry-run:
 //
 //   - RCLONE_CONFIG (the config file path) and RCLONE_CONFIG_* (RCLONE_CONFIG_PASS,
-//     RCLONE_CONFIG_DIR and env-defined remotes RCLONE_CONFIG_<REMOTE>_<OPTION>);
+//     RCLONE_CONFIG_DIR and env-defined named remotes RCLONE_CONFIG_<REMOTE>_<OPTION>);
 //   - config decryption: RCLONE_PASSWORD_COMMAND, RCLONE_ASK_PASSWORD;
 //   - transport tuning (fs/config.go, configflags): timeouts, retries, TLS
 //     material, bandwidth/transaction limits, user agent, bind address, HTTP/2 and
@@ -228,5 +232,6 @@ func allowedInChildEnv(upperName string) bool {
 	if _, ok := allowedRcloneEnv[upperName]; ok {
 		return true
 	}
-	return strings.HasPrefix(upperName, rcloneConfigEnvPrefix) && len(upperName) > len(rcloneConfigEnvPrefix)
+	return strings.HasPrefix(upperName, rcloneConfigEnvPrefix) &&
+		len(upperName) > len(rcloneConfigEnvPrefix) && !strings.Contains(upperName, ":")
 }

@@ -53,6 +53,9 @@ type Options struct {
 	// Timeout optionally bounds every rclone invocation (including the startup
 	// probe). Zero means each call is bounded only by the caller's context.
 	Timeout time.Duration
+	// DisableListR passes --disable ListR to every rclone invocation. Use it for
+	// providers whose recursive listing is broken.
+	DisableListR bool
 	// PersistencePaths declares local filesystem roots used by the backend. Inline
 	// :local: remotes are discovered automatically, so this is primarily for named
 	// remotes, which are never introspected. Entries are already-effective roots;
@@ -112,10 +115,11 @@ func New(opts Options) (*Store, error) {
 	}
 
 	r := &runner{
-		binary:     resolved,
-		configPath: opts.ConfigPath,
-		timeout:    opts.Timeout,
-		redact:     newRedactor(remote, opts.ConfigPath),
+		binary:       resolved,
+		configPath:   opts.ConfigPath,
+		timeout:      opts.Timeout,
+		disableListR: opts.DisableListR,
+		redact:       newRedactor(remote, opts.ConfigPath),
 	}
 	bs := newBlobStore(r, opts.Remote, opts.Prefix, paths)
 

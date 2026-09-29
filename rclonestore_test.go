@@ -671,3 +671,36 @@ func TestLegacyLayoutErrorText(t *testing.T) {
 		t.Fatalf("ErrLegacyLayout = %q", got)
 	}
 }
+
+func TestNewDisableListRFlag(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		disable bool
+	}{
+		{name: "default"},
+		{name: "disabled", disable: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			argvPath := filepath.Join(dir, "argv")
+			bin := writeFakeRclone(t, dir, fakeSpec{argvPath: argvPath})
+			_, err := New(Options{Remote: "named", Binary: bin, DisableListR: tt.disable})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			argv := readArgv(t, argvPath)
+			wantCount := 0
+			if tt.disable {
+				wantCount = 1
+			}
+			if got := countOf(argv, "--disable"); got != wantCount {
+				t.Fatalf("--disable count = %d, want %d; argv=%v", got, wantCount, argv)
+			}
+			if tt.disable && (len(argv) < 3 || argv[0] != "--disable" || argv[1] != "ListR" || argv[2] != "lsf") {
+				t.Fatalf("--disable ListR must precede subcommand; argv=%v", argv)
+			}
+		})
+	}
+}
