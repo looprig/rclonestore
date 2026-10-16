@@ -267,7 +267,7 @@ refusal and the directory-is-not-a-conflict case on a real `:local:` root. Setti
 `RCLONESTORE_CONFORMANCE_REMOTE` to any remote (for example an S3-compatible bucket) runs the same
 suite there, one fresh prefix per backend instance.
 
-The baseline is Go 1.26.8. Every Go command (and every make target) runs with **`GOWORK=off`**,
+The baseline is Go 1.26.9. Every Go command (and every make target) runs with **`GOWORK=off`**,
 so a module is verified against its pinned dependencies rather than a workspace;
 `GOWORK=off go test ./...` runs the unit tests. `examples/blob-remote` is a runnable example.
 
